@@ -18,7 +18,8 @@ struct Cli {
     #[arg(long)]
     product: Option<String>,
 
-    /// MVT source-layer name pattern. Must contain the {seq} placeholder.
+    /// MVT source-layer name pattern. Must contain the {seq} placeholder when
+    /// several layers are written; a single layer may use a fixed name.
     #[arg(long, default_value = "layer_{seq}")]
     layer_name_pattern: String,
 

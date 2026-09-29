@@ -71,16 +71,21 @@ impl Default for ConvertOptions {
 /// Builds the source-layer names, numbering from `layer_seq_start`.
 ///
 /// Products are ordered by valid time, so an offset lets the numbering match
-/// the forecast hours of the input (for example `FH01-06` starting at 1).
-fn build_layer_names(options: &ConvertOptions, count: usize) -> Vec<String> {
+/// the forecast hours of the input (for example `FH01-06` starting at 1). A
+/// pattern without `{seq}` names a single layer as it is, such as `dosha`.
+fn build_layer_names(options: &ConvertOptions, count: usize) -> Result<Vec<String>> {
+    ensure!(
+        count <= 1 || options.layer_name_pattern.contains("{seq}"),
+        "{count} layers need the {{seq}} placeholder in the layer name pattern"
+    );
     let start = options.layer_seq_start;
-    (start..start + count)
+    Ok((start..start + count)
         .map(|sequence| {
             options
                 .layer_name_pattern
                 .replace("{seq}", &sequence.to_string())
         })
-        .collect()
+        .collect())
 }
 
 pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<()> {
@@ -94,7 +99,7 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
         options.min_lead_time,
     )?;
     let mut products = prepare::prepare_products(products);
-    let layer_names = build_layer_names(options, products.len());
+    let layer_names = build_layer_names(options, products.len())?;
 
     ensure_compatible_products(&products)?;
     apply_renames(&mut products, &options.rename)?;
@@ -598,8 +603,8 @@ fn normalize_empty_leaf_offset(file: &mut (impl Read + Write + Seek)) -> Result<
 
 fn validate_options(options: &ConvertOptions) -> Result<()> {
     ensure!(
-        options.layer_name_pattern.contains("{seq}"),
-        "layer name pattern must contain the {{seq}} placeholder"
+        !options.layer_name_pattern.is_empty(),
+        "layer name pattern must not be empty"
     );
     if let Some(layer_count) = options.layer_count {
         ensure!(layer_count > 0, "layer count must be greater than zero");
@@ -1150,7 +1155,7 @@ mod tests {
             ..Default::default()
         };
         validate_options(&options).unwrap();
-        let names = build_layer_names(&options, 12);
+        let names = build_layer_names(&options, 12).unwrap();
 
         assert_eq!(names.first().unwrap(), "rain250m_0");
         assert_eq!(names.last().unwrap(), "rain250m_11");
@@ -1166,7 +1171,7 @@ mod tests {
         };
         validate_options(&options).unwrap();
 
-        let names = build_layer_names(&options, 6);
+        let names = build_layer_names(&options, 6).unwrap();
 
         assert_eq!(names.first().unwrap(), "rain1km6h_1");
         assert_eq!(names.last().unwrap(), "rain1km6h_6");
@@ -1324,12 +1329,28 @@ mod tests {
     }
 
     #[test]
-    fn layer_pattern_requires_placeholder() {
+    fn layer_pattern_without_placeholder_names_a_single_layer() {
         let options = ConvertOptions {
-            layer_name_pattern: "rain250m".into(),
+            layer_name_pattern: "dosha".into(),
             ..Default::default()
         };
-        assert!(validate_options(&options).is_err());
+        validate_options(&options).unwrap();
+
+        assert_eq!(build_layer_names(&options, 1).unwrap(), ["dosha"]);
+    }
+
+    #[test]
+    fn layer_pattern_without_placeholder_rejects_several_layers() {
+        let options = ConvertOptions {
+            layer_name_pattern: "dosha".into(),
+            ..Default::default()
+        };
+
+        let error = build_layer_names(&options, 2).unwrap_err();
+        assert!(
+            error.to_string().contains("{seq}"),
+            "unexpected error: {error}"
+        );
     }
 
     fn product(minutes: i64, process: GeneratingProcessType) -> PreparedProduct {
