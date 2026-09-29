@@ -54,6 +54,8 @@ cargo run --release -- input.grib2.bin.gz output.pmtiles \
 
 ### 例（降水強度の階級）
 
+以下は出力の柔軟性を検証するものであり、商用サービスの模倣を意図するものではありません。
+
 #### 気象庁ライク
 
 ```bash
