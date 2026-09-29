@@ -31,6 +31,8 @@ png = "0.18.1"
 
 [dev-dependencies]
 chrono = "0.4.45"
+# Tests decode the tiles they render.
+fast-mvt = { version = "0.6.2", default-features = false, features = ["writer", "reader"] }
 
 [profile.release]
 lto = "fat"

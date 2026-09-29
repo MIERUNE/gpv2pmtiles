@@ -237,7 +237,7 @@ pub(crate) fn generate_metadata(
     metadata.insert(
         "format".into(),
         json!(match output {
-            TileOutput::Mvt => "pbf",
+            TileOutput::Mvt(_) => "pbf",
             TileOutput::Raster(_) => "png",
         }),
     );
@@ -274,7 +274,7 @@ pub(crate) fn generate_metadata(
                 metadata.insert("sequence".into(), json!(sequence));
             }
         }
-        TileOutput::Mvt => {
+        TileOutput::Mvt(_) => {
             metadata.insert("vector_layers".into(), json!(vector_layers));
         }
     }

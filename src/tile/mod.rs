@@ -48,7 +48,7 @@ impl TileContext {
             mx2: (x + 1) as f64 / (1 << z) as f64,
             my2: (y + 1) as f64 / (1 << z) as f64,
         };
-        let buffer = (bounds.mx2 - bounds.mx1) * (2.0 / 256.0);
+        let buffer = (bounds.mx2 - bounds.mx1) * (f64::from(CONTEXT_BUFFER) / 256.0);
         let (lng1, lat1) = web_mercator_to_lnglat(bounds.mx1 - buffer, bounds.my2 + buffer);
         let (lng2, lat2) = web_mercator_to_lnglat(bounds.mx2 + buffer, bounds.my1 - buffer);
 
@@ -368,9 +368,35 @@ fn source_chunks(
 /// raster archive holds a single product; [`crate::archive`] enforces that.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum TileOutput {
-    Mvt,
+    Mvt(MvtLayout),
     Raster(ColorEncoding),
 }
+
+/// The coordinate space of an MVT tile.
+///
+/// A client does not care which is used, but matching them to an existing
+/// tileset lets the tiles be compared, or substituted, feature for feature.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MvtLayout {
+    /// Units across the tile.
+    pub(crate) extent: u32,
+    /// Geometry kept beyond each edge, in 1/256ths of the tile width - the
+    /// pixels of a 256px tile, as tippecanoe counts them.
+    pub(crate) buffer: u32,
+}
+
+impl Default for MvtLayout {
+    fn default() -> Self {
+        Self {
+            extent: 4096,
+            buffer: 2,
+        }
+    }
+}
+
+/// The margin [`TileContext`] reads around every tile, in the same units as
+/// [`MvtLayout::buffer`].
+const CONTEXT_BUFFER: u32 = 2;
 
 pub(crate) fn make_layer(
     tile_context: &TileContext,
@@ -378,7 +404,6 @@ pub(crate) fn make_layer(
     layer_name: &str,
     output: TileOutput,
 ) -> Result<Option<Vec<u8>>> {
-    let extent = 4096;
     let (z, _, _) = tile_context.zxy;
     let (chunk_begin, chunk_end) = zxy_to_chunk_id_range(product.spec.base_z, tile_context.zxy);
     if product.chunks_in_range(chunk_begin, chunk_end).is_empty() {
@@ -403,7 +428,15 @@ pub(crate) fn make_layer(
                 2.0 / f64::from(grid.lat_denom).abs(),
             )
         }
-        TileOutput::Mvt => (0.0, 0.0),
+        // A buffer wider than the one the context reads needs the cells under
+        // the rest of it. Degrees of latitude span no more of the mercator
+        // tile than the same degrees of longitude, so the longitude width
+        // covers both.
+        TileOutput::Mvt(layout) => {
+            let excess = layout.buffer.saturating_sub(CONTEXT_BUFFER);
+            let degrees = 360.0 / f64::from(1u32 << z) * f64::from(excess) / 256.0;
+            (degrees, degrees)
+        }
     };
     let geographic_bounds = tile_context.geographic_bounds.expanded(reach.0, reach.1);
     let wrapped_geographic_bounds = tile_context
@@ -525,10 +558,10 @@ pub(crate) fn make_layer(
     let band_scales = band_scales(product);
 
     match output {
-        TileOutput::Mvt => mvt::render_mvt_layer(
+        TileOutput::Mvt(layout) => mvt::render_mvt_layer(
             layer_name,
             &product.spec,
-            extent,
+            layout,
             &tile_context.bounds,
             &points,
             &band_scales,

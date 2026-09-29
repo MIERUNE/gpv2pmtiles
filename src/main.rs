@@ -41,6 +41,16 @@ struct Cli {
     #[arg(long)]
     max_zoom: Option<u8>,
 
+    /// MVT tile extent, the number of units across a tile. [default: 4096]
+    #[arg(long)]
+    extent: Option<u32>,
+
+    /// MVT geometry kept beyond each tile edge, in 1/256ths of the tile width
+    /// (the pixels of a 256px tile, as in tippecanoe). With --extent 256 one
+    /// pixel is one tile unit. [default: 2]
+    #[arg(long, value_name = "PIXELS")]
+    buffer: Option<u32>,
+
     /// Drop products that are analyses rather than forecasts. Nowcast inputs
     /// lead with the observed field, valid at the reference time itself, which
     /// otherwise becomes the first layer.
@@ -139,6 +149,8 @@ fn main() -> Result<()> {
             quantize: cli.quantize,
             omit_class: cli.omit_class,
             omit_zero: cli.omit_zero,
+            extent: cli.extent,
+            buffer: cli.buffer,
             raster: cli.raster,
             manifest: cli.manifest,
             skip_analysis: cli.skip_analysis,

@@ -7,7 +7,7 @@ use crate::{
     geo::lat_to_web_mercator_y,
     model::{CompactOptI32, TilesetSpec},
     tile::{
-        BandScale, Point, PointMap, TileBounds,
+        BandScale, MvtLayout, Point, PointMap, TileBounds,
         rect_union::{IntRect, union_rectangles},
     },
 };
@@ -15,7 +15,7 @@ use crate::{
 pub(super) fn render_mvt_layer(
     layer_name: &str,
     tileset_spec: &TilesetSpec,
-    extent: i32,
+    layout: MvtLayout,
     tile_bounds: &TileBounds,
     deduped_points: &PointMap<(u32, u32), Point>,
     band_scales: &Vec<BandScale<'_>>,
@@ -24,7 +24,7 @@ pub(super) fn render_mvt_layer(
         deduped_points,
         &tileset_spec.grid_spec,
         tile_bounds,
-        extent,
+        layout,
     );
     if grouped_rectangles.is_empty() {
         return Ok(None);
@@ -51,7 +51,7 @@ pub(super) fn render_mvt_layer(
 
     // Encode features
     let mut layer = MvtLayerBuilder::with_capacity(layer_name, value_geom.len())?;
-    layer.extent(std::num::NonZeroU32::new(extent as u32).expect("MVT extent is positive"));
+    layer.extent(std::num::NonZeroU32::new(layout.extent).expect("MVT extent is positive"));
     for (values, geometry) in value_geom {
         let mut feature = layer.feature(&geometry)?;
         for (band, raw_value) in band_scales.iter().zip(values) {
@@ -97,11 +97,12 @@ fn make_rectangles_grouped_by_value(
     deduped_points: &PointMap<(u32, u32), Point>,
     grid_spec: &gpv_products::model::LngLatGrid,
     tile_bounds: &TileBounds,
-    extent: i32,
+    layout: MvtLayout,
 ) -> HashMap<[CompactOptI32; 4], Vec<IntRect>> {
     let mut grouped_rectangles: HashMap<[CompactOptI32; 4], Vec<IntRect>> = HashMap::default();
-    let buffer_pixels = 2;
-    let buffer = buffer_pixels * extent / 256;
+    // Both are bounded by `validate_options`, so neither overflows an i32.
+    let extent = layout.extent as i32;
+    let buffer = (layout.buffer * layout.extent / 256) as i32;
     let tile_width = tile_bounds.mx2 - tile_bounds.mx1;
     let w = (extent as f64) / tile_width;
     let mut projected_y = HashMap::<(u32, u32), (f64, f64)>::default();
@@ -218,6 +219,120 @@ mod tests {
         assert_eq!(
             unique_feature_id(&[value(1), value(2), value(3), value(4)]),
             None
+        );
+    }
+
+    fn grid() -> gpv_products::model::LngLatGrid {
+        // One-degree columns and 2/3-degree rows whose first cell starts at
+        // 10W 10S.
+        gpv_products::model::LngLatGrid {
+            lng_0: -10.0 + 0.5,
+            lat_0: -10.0 + 0.5 / 1.5,
+            lng_denom: 1.0,
+            lat_denom: 1.5,
+        }
+    }
+
+    /// Tile 2/2/1, which spans 0-90E and 0-66.5N.
+    const TILE: TileBounds = TileBounds {
+        mx1: 0.5,
+        my1: 0.25,
+        mx2: 0.75,
+        my2: 0.5,
+    };
+
+    fn cell(dn: i32, power: u8) -> Point {
+        let mut values = [CompactOptI32::NONE; 4];
+        values[0] = value(dn);
+        Point {
+            values,
+            counts: [1, 0, 0, 0],
+            power,
+        }
+    }
+
+    /// One cell reaching past every edge of the tile, so the rectangle is
+    /// whatever the buffer clamps it to.
+    fn rectangles_past_every_edge(layout: MvtLayout) -> Vec<IntRect> {
+        let mut points = PointMap::default();
+        points.insert((0, 0), cell(1, 7));
+
+        make_rectangles_grouped_by_value(&points, &grid(), &TILE, layout)
+            .into_values()
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn the_buffer_is_counted_in_pixels_of_a_256px_tile() {
+        assert_eq!(
+            rectangles_past_every_edge(MvtLayout::default()),
+            [IntRect::new(-32, -32, 4128, 4128)]
+        );
+        assert_eq!(
+            rectangles_past_every_edge(MvtLayout {
+                extent: 256,
+                buffer: 1,
+            }),
+            [IntRect::new(-1, -1, 257, 257)]
+        );
+    }
+
+    #[test]
+    fn a_fixed_layer_carries_the_extent_and_an_integer_dn() {
+        let spec = TilesetSpec {
+            name: String::new(),
+            base_z: 0,
+            grid_spec: grid(),
+            aggregation: gpv_products::model::Aggregation::Max,
+            band_specs: vec![gpv_products::model::BandSpec {
+                name: "DN".to_string(),
+                ..Default::default()
+            }],
+            quantize: vec![None],
+            omit_zero: vec![None],
+            omit_class: vec![None],
+            bounds: [0.0; 4],
+        };
+        let scales = vec![BandScale {
+            name: "DN",
+            scaling: false,
+            reference: 0.0,
+            binary_scale: 1.0,
+            decimal_scale: 1.0,
+            quantize: None,
+        }];
+        let mut points = PointMap::default();
+        points.insert((0, 0), cell(-1, 6));
+        points.insert((64, 0), cell(4, 6));
+        let layout = MvtLayout {
+            extent: 256,
+            buffer: 1,
+        };
+
+        let bytes = render_mvt_layer("dosha", &spec, layout, &TILE, &points, &scales)
+            .unwrap()
+            .unwrap();
+
+        let reader = fast_mvt::MvtReaderRef::new(&bytes).unwrap();
+        let layer = reader.layers().next().unwrap();
+        assert_eq!(layer.name(), "dosha");
+        assert_eq!(layer.version(), 2);
+        assert_eq!(layer.extent(), 256);
+        assert_eq!(layer.keys(), ["DN"]);
+        let features = layer
+            .features()
+            .map(|feature| {
+                let properties = feature.properties_vec().unwrap();
+                (feature.id(), properties[0].0, properties[0].1)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            features,
+            [
+                (Some(0xFFFF_FFFF), "DN", fast_mvt::MvtValueRef::SInt(-1)),
+                (Some(4), "DN", fast_mvt::MvtValueRef::SInt(4)),
+            ]
         );
     }
 

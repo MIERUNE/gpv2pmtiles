@@ -17,7 +17,9 @@ use crate::{
     metadata,
     model::PreparedProduct,
     prepare, quantize,
-    tile::{ColorEncoding, TileContext, TileOutput, Zxy, make_layer, zxy_to_chunk_id_range},
+    tile::{
+        ColorEncoding, MvtLayout, TileContext, TileOutput, Zxy, make_layer, zxy_to_chunk_id_range,
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -37,6 +39,11 @@ pub struct ConvertOptions {
     pub omit_class: Vec<String>,
     /// Leave out cells whose physical value is zero before quantization.
     pub omit_zero: bool,
+    /// MVT tile extent. Defaults to 4096.
+    pub extent: Option<u32>,
+    /// MVT geometry kept beyond each tile edge, in 1/256ths of the tile width.
+    /// Defaults to 2.
+    pub buffer: Option<u32>,
     /// Emit RGBA raster tiles with this colour encoding instead of MVT.
     pub raster: Option<String>,
     /// Write an index of the raster archives to this path.
@@ -60,6 +67,8 @@ impl Default for ConvertOptions {
             quantize: Vec::new(),
             omit_class: Vec::new(),
             omit_zero: false,
+            extent: None,
+            buffer: None,
             raster: None,
             manifest: None,
             skip_analysis: false,
@@ -139,11 +148,17 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
             )?;
             TileOutput::Raster(encoding)
         }
-        None => TileOutput::Mvt,
+        None => {
+            let default = MvtLayout::default();
+            TileOutput::Mvt(MvtLayout {
+                extent: options.extent.unwrap_or(default.extent),
+                buffer: options.buffer.unwrap_or(default.buffer),
+            })
+        }
     };
 
     match output_format {
-        TileOutput::Mvt => {
+        TileOutput::Mvt(_) => {
             ensure_distinct_paths(input, &[output.to_path_buf()], None)?;
             write_archive(
                 output,
@@ -346,7 +361,7 @@ fn write_manifest(
         // opens any archive, and having to open one to find the rest is exactly
         // what the manifest is for avoiding.
         TileOutput::Raster(encoding) => metadata::raster_encoding(products.first(), encoding),
-        TileOutput::Mvt => serde_json::Value::Null,
+        TileOutput::Mvt(_) => serde_json::Value::Null,
     };
     let manifest = serde_json::json!({
         "generator": "grib2pmtiles",
@@ -461,7 +476,7 @@ fn write_archive(
             }
             report
         }),
-        TileOutput::Mvt => None,
+        TileOutput::Mvt(_) => None,
     };
 
     let bounds = combined_bounds(products);
@@ -501,7 +516,7 @@ fn write_archive(
         .with_context(|| format!("failed to create output {}", output.display()))?;
     // A PNG is already deflated; gzipping it again only costs time.
     let (tile_type, tile_compression) = match output_format {
-        TileOutput::Mvt => (TileType::Mvt, Compression::Gzip),
+        TileOutput::Mvt(_) => (TileType::Mvt, Compression::Gzip),
         TileOutput::Raster(_) => (TileType::Png, Compression::None),
     };
     let mut writer = PmTilesWriter::new(tile_type)
@@ -601,6 +616,10 @@ fn normalize_empty_leaf_offset(file: &mut (impl Read + Write + Seek)) -> Result<
     Ok(())
 }
 
+/// Keeps `extent + buffer` and `buffer * extent` well inside an i32.
+const MAX_MVT_EXTENT: u32 = 1 << 16;
+const MAX_MVT_BUFFER: u32 = 256;
+
 fn validate_options(options: &ConvertOptions) -> Result<()> {
     ensure!(
         !options.layer_name_pattern.is_empty(),
@@ -615,6 +634,22 @@ fn validate_options(options: &ConvertOptions) -> Result<()> {
     if let Some(spec) = &options.raster {
         spec.parse::<ColorEncoding>()?;
     }
+    if let Some(extent) = options.extent {
+        ensure!(
+            (1..=MAX_MVT_EXTENT).contains(&extent),
+            "--extent must be between 1 and {MAX_MVT_EXTENT}"
+        );
+    }
+    if let Some(buffer) = options.buffer {
+        ensure!(
+            buffer <= MAX_MVT_BUFFER,
+            "--buffer must not exceed {MAX_MVT_BUFFER}, a whole tile width"
+        );
+    }
+    ensure!(
+        options.raster.is_none() || (options.extent.is_none() && options.buffer.is_none()),
+        "--extent and --buffer apply to MVT output, not to --raster"
+    );
     ensure!(
         options.manifest.is_none() || options.raster.is_some(),
         "--manifest indexes the archives --raster produces, so it needs --raster as well"
@@ -972,7 +1007,7 @@ fn traverse_tile_pyramid(
             let tile = match output {
                 // MVT layers concatenate into one tile, and the archive stores
                 // them gzipped.
-                TileOutput::Mvt => {
+                TileOutput::Mvt(_) => {
                     let mut protobuf = Vec::with_capacity(layers.iter().map(Vec::len).sum());
                     for layer in layers {
                         protobuf.extend_from_slice(&layer);
@@ -1337,6 +1372,41 @@ mod tests {
         validate_options(&options).unwrap();
 
         assert_eq!(build_layer_names(&options, 1).unwrap(), ["dosha"]);
+    }
+
+    #[test]
+    fn extent_and_buffer_are_bounded() {
+        for (extent, buffer) in [
+            (Some(0), None),
+            (Some((1 << 16) + 1), None),
+            (None, Some(257)),
+        ] {
+            let options = ConvertOptions {
+                extent,
+                buffer,
+                ..Default::default()
+            };
+            assert!(
+                validate_options(&options).is_err(),
+                "extent {extent:?} buffer {buffer:?} was accepted"
+            );
+        }
+        let options = ConvertOptions {
+            extent: Some(256),
+            buffer: Some(1),
+            ..Default::default()
+        };
+        validate_options(&options).unwrap();
+    }
+
+    #[test]
+    fn extent_and_buffer_are_refused_for_raster_output() {
+        let options = ConvertOptions {
+            raster: Some("scalar16:0,1".into()),
+            extent: Some(256),
+            ..Default::default()
+        };
+        assert!(validate_options(&options).is_err());
     }
 
     #[test]
