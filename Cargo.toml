@@ -19,7 +19,6 @@ fast-mvt = { version = "0.6.2", default-features = false, features = ["writer"] 
 fast_hilbert = "2.1.0"
 foldhash = "0.2.0"
 gpv-products = { path = "crates/gpv-products" }
-itertools = "0.14.0"
 pmtiles = { version = "0.23", default-features = false, features = ["write"] }
 rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }

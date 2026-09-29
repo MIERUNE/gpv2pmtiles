@@ -428,7 +428,6 @@ dependencies = [
  "flate2",
  "foldhash 0.2.0",
  "gpv-products",
- "itertools",
  "pmtiles",
  "png",
  "rayon",
