@@ -1341,6 +1341,23 @@ mod tests {
     }
 
     #[test]
+    fn kikikuru_dosha_keeps_only_minus_one_and_the_warning_levels() {
+        // The 5.200 level table of the 2019-10-12 13:10 UTC analysis runs from
+        // -2 to 7; the grid holds -2 (8,224,072 cells), -1 (203), 0 (252,803)
+        // and 1 through 4.
+        let product = GpvProductIdentifier {
+            kind: GpvProductElement::KikikuruDosha,
+            ..Default::default()
+        };
+        let mut values = vec![-3, -2, -1, 0, 1, 2, 3, 4];
+
+        product.translate_values(&mut values, 0);
+
+        let missing = i32::MIN;
+        assert_eq!(values, [missing, missing, -1, missing, 1, 2, 3, 4]);
+    }
+
+    #[test]
     fn test_unknown_mappings() {
         // Test that unknown combinations return Unknown
         let unknown_cases = vec![
