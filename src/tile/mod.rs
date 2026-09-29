@@ -10,7 +10,6 @@ mod rect_union;
 use anyhow::Result;
 use fast_mvt::MvtValue;
 use gpv_products::model::Aggregation;
-use itertools::Itertools;
 use rayon::prelude::*;
 
 use fast_hilbert::xy2h;
@@ -451,26 +450,28 @@ pub(crate) fn make_layer(
         .fold(PointMap::default, |mut points, (_, tile)| {
             let aggregation_scale = maximum_detail_zoom.saturating_sub(z);
             let aggregation_width = 1 << aggregation_scale;
-            let mut previous_end = 0;
+            debug_assert_eq!(tile.point_positions.len(), tile.point_powers.len());
+            let aggregation_mask = !(aggregation_width - 1);
+            let group_key = |index: usize| {
+                let (x, y) = tile.point_positions[index];
+                (
+                    u32::from(x) & aggregation_mask,
+                    u32::from(y) & aggregation_mask,
+                    tile.point_powers[index],
+                )
+            };
 
-            for ((grid_x, grid_y, point_power), group) in tile
-                .point_positions
-                .iter()
-                .copied()
-                .zip_eq(tile.point_powers.iter().copied())
-                .chunk_by(|&((x, y), point_power)| {
-                    let (x, y) = (u32::from(x), u32::from(y));
-                    (
-                        x - x % aggregation_width,
-                        y - y % aggregation_width,
-                        point_power,
-                    )
-                })
-                .into_iter()
-            {
-                let end = previous_end + group.count();
-                let begin = previous_end;
-                previous_end = end;
+            let mut begin = 0;
+            while begin < tile.point_positions.len() {
+                let group_begin = begin;
+                let (grid_x, grid_y, point_power) = group_key(begin);
+                let mut end = begin + 1;
+                while end < tile.point_positions.len()
+                    && group_key(end) == (grid_x, grid_y, point_power)
+                {
+                    end += 1;
+                }
+                begin = end;
                 let power = point_power.max(aggregation_scale);
                 let width = 1 << power;
 
@@ -490,7 +491,7 @@ pub(crate) fn make_layer(
                 let mut counts = [0; 4];
                 for (band_index, band) in tile.bands.iter().enumerate() {
                     (values[band_index], counts[band_index]) =
-                        aggregate_band(&band.values[begin..end], aggregation);
+                        aggregate_band(&band.values[group_begin..end], aggregation);
                 }
 
                 merge_point(
