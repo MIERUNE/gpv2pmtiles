@@ -1,12 +1,6 @@
 use std::f64::consts::FRAC_PI_2;
 
-/// Converts a geographic coordinate to normalized Web Mercator coordinates.
-#[inline]
-pub(crate) fn lnglat_to_web_mercator(lng: f64, lat: f64) -> (f64, f64) {
-    let mx = (lng + 180.0) / 360.0;
-    (mx, lat_to_web_mercator_y(lat))
-}
-
+/// Converts a latitude to the normalized Web Mercator Y coordinate.
 #[inline]
 pub(crate) fn lat_to_web_mercator_y(lat: f64) -> f64 {
     let my = ((90.0 + lat).to_radians() / 2.0).tan().ln().to_degrees();
@@ -74,7 +68,7 @@ mod tests {
     #[test]
     fn web_mercator_roundtrip() {
         for (lng, lat) in [(136.08, 37.39), (0.3, 0.2), (0.0, 0.0)] {
-            let (mx, my) = lnglat_to_web_mercator(lng, lat);
+            let (mx, my) = ((lng + 180.0) / 360.0, lat_to_web_mercator_y(lat));
             let (actual_lng, actual_lat) = web_mercator_to_lnglat(mx, my);
             assert!((lng - actual_lng).abs() < 1e-13);
             assert!((lat - actual_lat).abs() < 1e-13);

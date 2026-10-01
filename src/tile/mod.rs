@@ -253,7 +253,9 @@ fn apply_omits(
     if !omits.iter().any(Option::is_some) {
         return false;
     }
-    for point in points.values_mut() {
+    // Clearing an omitted value and dropping a point left with no values happen
+    // in one pass: the retained set only depends on values this closure sees.
+    points.retain(|_, point| {
         for (index, omit) in omits.iter().enumerate() {
             if let Some(omit) = omit {
                 point.values[index] = point.values[index].map(|value| {
@@ -265,8 +267,6 @@ fn apply_omits(
                 });
             }
         }
-    }
-    points.retain(|_, point| {
         point.values[..band_count]
             .iter()
             .any(|value| value.get().is_some())
@@ -444,76 +444,118 @@ pub(crate) fn make_layer(
 
     let aggregation = product.spec.aggregation;
     let band_count = product.spec.band_specs.len();
-    let mut points = chunks
-        .par_iter()
-        .flat_map(|chunk| chunk.par_iter())
-        .fold(PointMap::default, |mut points, (_, tile)| {
-            let aggregation_scale = maximum_detail_zoom.saturating_sub(z);
-            let aggregation_width = 1 << aggregation_scale;
-            debug_assert_eq!(tile.point_positions.len(), tile.point_powers.len());
-            let aggregation_mask = !(aggregation_width - 1);
-            let group_key = |index: usize| {
-                let (x, y) = tile.point_positions[index];
-                (
-                    u32::from(x) & aggregation_mask,
-                    u32::from(y) & aggregation_mask,
-                    tile.point_powers[index],
-                )
-            };
+    let aggregation_scale = maximum_detail_zoom.saturating_sub(z);
+    let aggregation_width = 1u32 << aggregation_scale;
+    let aggregation_mask = !(aggregation_width - 1);
+    let grid = &product.spec.grid_spec;
 
-            let mut begin = 0;
-            while begin < tile.point_positions.len() {
-                let group_begin = begin;
-                let (grid_x, grid_y, point_power) = group_key(begin);
-                let mut end = begin + 1;
-                while end < tile.point_positions.len()
-                    && group_key(end) == (grid_x, grid_y, point_power)
-                {
-                    end += 1;
-                }
-                begin = end;
-                let power = point_power.max(aggregation_scale);
-                let width = 1 << power;
+    let ingest = |points: &mut PointMap<(u32, u32), Point>, tile: &crate::model::BaseTile| {
+        debug_assert_eq!(tile.point_positions.len(), tile.point_powers.len());
+        let group_key = |index: usize| {
+            let (x, y) = tile.point_positions[index];
+            (
+                u32::from(x) & aggregation_mask,
+                u32::from(y) & aggregation_mask,
+                tile.point_powers[index],
+            )
+        };
 
-                let grid = &product.spec.grid_spec;
-                let lng1 = grid.lng_0 + (grid_x as f64 - 0.5) / grid.lng_denom as f64;
-                let lng2 = grid.lng_0 + ((grid_x + width) as f64 - 0.5) / grid.lng_denom as f64;
-                let lat2 = grid.lat_0 + (grid_y as f64 - 0.5) / grid.lat_denom as f64;
-                let lat1 = grid.lat_0 + ((grid_y + width) as f64 - 0.5) / grid.lat_denom as f64;
-                let point_box = LngLatBox::new(LngLat::new(lng1, lat1), LngLat::new(lng2, lat2));
-                if !geographic_bounds.intersects_box(&point_box)
-                    && (lng2 <= 180.0 || !wrapped_geographic_bounds.intersects_box(&point_box))
-                {
-                    continue;
-                }
-
-                let mut values = [CompactOptI32::NONE; 4];
-                let mut counts = [0; 4];
-                for (band_index, band) in tile.bands.iter().enumerate() {
-                    (values[band_index], counts[band_index]) =
-                        aggregate_band(&band.values[group_begin..end], aggregation);
-                }
-
-                merge_point(
-                    &mut points,
-                    (grid_x, grid_y),
-                    Point {
-                        values,
-                        counts,
-                        power,
-                    },
-                    aggregation,
-                    band_count,
-                );
+        let mut begin = 0;
+        while begin < tile.point_positions.len() {
+            let group_begin = begin;
+            let (grid_x, grid_y, point_power) = group_key(begin);
+            let mut end = begin + 1;
+            while end < tile.point_positions.len()
+                && group_key(end) == (grid_x, grid_y, point_power)
+            {
+                end += 1;
             }
-            points
-        })
-        .reduce(PointMap::default, |mut left, right| {
-            for (key, point) in right {
-                merge_point(&mut left, key, point, aggregation, band_count);
+            begin = end;
+            let power = point_power.max(aggregation_scale);
+            let width = 1 << power;
+
+            let lng1 = grid.lng_0 + (grid_x as f64 - 0.5) / grid.lng_denom as f64;
+            let lng2 = grid.lng_0 + ((grid_x + width) as f64 - 0.5) / grid.lng_denom as f64;
+            let lat2 = grid.lat_0 + (grid_y as f64 - 0.5) / grid.lat_denom as f64;
+            let lat1 = grid.lat_0 + ((grid_y + width) as f64 - 0.5) / grid.lat_denom as f64;
+            let point_box = LngLatBox::new(LngLat::new(lng1, lat1), LngLat::new(lng2, lat2));
+            if !geographic_bounds.intersects_box(&point_box)
+                && (lng2 <= 180.0 || !wrapped_geographic_bounds.intersects_box(&point_box))
+            {
+                continue;
             }
-            left
-        });
+
+            let mut values = [CompactOptI32::NONE; 4];
+            let mut counts = [0; 4];
+            for (band_index, band) in tile.bands.iter().enumerate() {
+                (values[band_index], counts[band_index]) =
+                    aggregate_band(&band.values[group_begin..end], aggregation);
+            }
+
+            merge_point(
+                points,
+                (grid_x, grid_y),
+                Point {
+                    values,
+                    counts,
+                    power,
+                },
+                aggregation,
+                band_count,
+            );
+        }
+    };
+
+    let mut points = if aggregation_scale == 0 {
+        // The group key is the grid cell itself here, so cells stay distinct
+        // across chunks; only cells lying on a chunk boundary repeat, in both
+        // neighbours. Sizing the map to the input count keeps it from ever
+        // rehashing, and one map avoids both the per-thread copies a parallel
+        // fold would build and the merge that would follow. The tile itself is
+        // already processed in parallel with its siblings.
+        let capacity = chunks
+            .iter()
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|(_, tile)| tile.point_positions.len())
+                    .sum::<usize>()
+            })
+            .sum();
+        let mut points = PointMap::with_capacity_and_hasher(capacity, <_>::default());
+        for chunk in &chunks {
+            for (_, tile) in chunk.iter() {
+                ingest(&mut points, tile);
+            }
+        }
+        points
+    } else {
+        chunks
+            .par_iter()
+            .map(|chunk| {
+                let point_count = chunk
+                    .iter()
+                    .map(|(_, tile)| tile.point_positions.len())
+                    .sum::<usize>();
+                // Dense coverage packs 4^scale cells into one group; sparse
+                // data keeps them apart. Sizing to the dense count only
+                // under-estimates then, which costs a rehash rather than
+                // correctness, and never over-allocates past the input.
+                let capacity = (point_count >> (2 * aggregation_scale)).max(16);
+                let mut points = PointMap::with_capacity_and_hasher(capacity, <_>::default());
+                for (_, tile) in chunk.iter() {
+                    ingest(&mut points, tile);
+                }
+                points
+            })
+            .reduce_with(|mut left, right| {
+                for (key, point) in right {
+                    merge_point(&mut left, key, point, aggregation, band_count);
+                }
+                left
+            })
+            .unwrap_or_default()
+    };
     if points.is_empty() {
         return Ok(None);
     }
