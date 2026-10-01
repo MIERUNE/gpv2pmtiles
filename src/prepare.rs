@@ -16,7 +16,7 @@ use tinygrib2::MessageReader;
 use fast_hilbert::xy2h;
 
 use crate::{
-    geo::lnglat_to_web_mercator,
+    geo::lat_to_web_mercator_y,
     model::{Band, BaseTile, CompactOptI32, PreparedProduct, TilesetSpec},
 };
 
@@ -95,24 +95,55 @@ fn prepare_product(
     let buffer = (2.0 / 256.0) / (1 << base_z) as f64;
     let mut tiles: HashMap<(u32, u32), Vec<TilePoint>> = HashMap::default();
 
+    // Every cell edge is a grid coordinate offset by half a cell, so the
+    // projections are shared: each column and row of the grid needs one
+    // longitude and one Mercator latitude, not one per point. The expressions
+    // are the same ones the per-point code used, in the same order, so the
+    // coordinates are unchanged bit for bit.
+    let max_edge = product_data
+        .points
+        .iter()
+        .map(|point| {
+            let edge = point.x as usize + (1 << point.point_power);
+            edge.max(point.y as usize + (1 << point.point_power))
+        })
+        .max()
+        .unwrap_or(0);
+    let lng_edge = (0..=max_edge)
+        .map(|edge| grid.lng_0 + (edge as f64 - 0.5) / grid.lng_denom as f64)
+        .collect::<Vec<_>>();
+    let mx_edge = lng_edge
+        .iter()
+        .map(|lng| (lng + 180.0) / 360.0)
+        .collect::<Vec<_>>();
+    let lat_edge = (0..=max_edge)
+        .map(|edge| grid.lat_0 + (edge as f64 - 0.5) / grid.lat_denom as f64)
+        .collect::<Vec<_>>();
+    let my_edge = lat_edge
+        .iter()
+        .map(|&lat| lat_to_web_mercator_y(lat))
+        .collect::<Vec<_>>();
+
     for point_bands in product_data
         .points
         .chunk_by(|left, right| left.point_id == right.point_id)
     {
         let point = point_bands.first().expect("point group is not empty");
         let width = 1 << point.point_power;
-        let lng1 = grid.lng_0 + (point.x as f64 - 0.5) / grid.lng_denom as f64;
-        let lng2 = grid.lng_0 + ((point.x + width) as f64 - 0.5) / grid.lng_denom as f64;
-        let lat1 = grid.lat_0 + ((point.y + width) as f64 - 0.5) / grid.lat_denom as f64;
-        let lat2 = grid.lat_0 + (point.y as f64 - 0.5) / grid.lat_denom as f64;
+        let lng1 = lng_edge[point.x as usize];
+        let lng2 = lng_edge[point.x as usize + width];
+        let lat1 = lat_edge[point.y as usize + width];
+        let lat2 = lat_edge[point.y as usize];
 
         min_lng = min_lng.min(lng1);
         max_lng = max_lng.max(lng2);
         min_lat = min_lat.min(lat2);
         max_lat = max_lat.max(lat1);
 
-        let (mx1, my1) = lnglat_to_web_mercator(lng1, lat1);
-        let (mx2, my2) = lnglat_to_web_mercator(lng2, lat2);
+        let mx1 = mx_edge[point.x as usize];
+        let mx2 = mx_edge[point.x as usize + width];
+        let my1 = my_edge[point.y as usize + width];
+        let my2 = my_edge[point.y as usize];
         if my1.is_nan() || my2.is_nan() {
             continue;
         }

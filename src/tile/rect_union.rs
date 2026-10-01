@@ -42,6 +42,32 @@ impl Edge {
     }
 }
 
+/// Coordinates are clamped to `[-buffer, extent + buffer]`, both bounded by
+/// `MAX_MVT_BUFFER * MAX_MVT_EXTENT / 256`, so 21 bits hold one with an offset.
+const COORD_OFFSET: i64 = 1 << 20;
+const COORD_BITS: u32 = 21;
+const COORD_MASK: i64 = (1 << COORD_BITS) - 1;
+
+#[inline]
+fn coord_code(value: i32) -> u64 {
+    debug_assert!((i64::from(value) + COORD_OFFSET) & !COORD_MASK == 0);
+    ((i64::from(value) + COORD_OFFSET) & COORD_MASK) as u64
+}
+
+/// The order `merge_horizontal_runs` sorts in, as one comparable integer.
+#[inline]
+fn run_sort_key(rectangle: IntRect) -> u64 {
+    (coord_code(rectangle.y1) << (2 * COORD_BITS))
+        | (coord_code(rectangle.y2) << COORD_BITS)
+        | coord_code(rectangle.x1)
+}
+
+/// The order the sweep ends bands in, as one comparable integer.
+#[inline]
+fn end_sort_key(band: IntRect, index: u32) -> u64 {
+    (coord_code(band.y2) << 32) | u64::from(index)
+}
+
 /// Unions axis-aligned rectangles and returns MVT-ready polygons.
 ///
 /// A horizontal sweep maintains the covered X intervals above and below each
@@ -68,15 +94,20 @@ pub(super) fn union_rectangles(mut rectangles: Vec<IntRect>) -> Result<Vec<MvtPo
         return Ok(vec![rectangle_polygon(rectangles[0])]);
     }
     let bands = rectangles;
-    let mut by_end = (0..bands.len() as u32).collect::<Vec<_>>();
-    by_end.sort_unstable_by_key(|&index| bands[index as usize].y2);
+    let mut by_end = bands
+        .iter()
+        .enumerate()
+        .map(|(index, band)| end_sort_key(*band, index as u32))
+        .collect::<Vec<_>>();
+    by_end.sort_unstable();
 
     // Sorted by (x1, x2), so the covered intervals fall out of a linear scan
     // and never have to be re-sorted.
     let mut active = Vec::<(i32, i32, u32)>::new();
     let mut covered_above = Vec::<(i32, i32)>::new();
     let mut covered_below = Vec::<(i32, i32)>::new();
-    let mut edges = Vec::<Edge>::new();
+    // A band contributes a pair of vertical edges and its two horizontal ends.
+    let mut edges = Vec::<Edge>::with_capacity(bands.len().saturating_mul(4));
     let mut xs = Vec::<i32>::new();
     let mut band_start_y = 0;
 
@@ -84,7 +115,9 @@ pub(super) fn union_rectangles(mut rectangles: Vec<IntRect>) -> Result<Vec<MvtPo
     while start_index < bands.len() || end_index < by_end.len() {
         let y = match (
             bands.get(start_index),
-            by_end.get(end_index).map(|&index| bands[index as usize]),
+            by_end
+                .get(end_index)
+                .map(|&entry| bands[entry as u32 as usize]),
         ) {
             (Some(starting), Some(ending)) => starting.y1.min(ending.y2),
             (Some(starting), None) => starting.y1,
@@ -96,11 +129,11 @@ pub(super) fn union_rectangles(mut rectangles: Vec<IntRect>) -> Result<Vec<MvtPo
             add_interval(&mut active, band.x1, band.x2);
             start_index += 1;
         }
-        while let Some(band) = by_end
-            .get(end_index)
-            .map(|&index| bands[index as usize])
-            .filter(|band| band.y2 == y)
-        {
+        while let Some(&entry) = by_end.get(end_index) {
+            let band = bands[entry as u32 as usize];
+            if band.y2 != y {
+                break;
+            }
             remove_interval(&mut active, band.x1, band.x2);
             end_index += 1;
         }
@@ -167,7 +200,7 @@ fn rectangle_polygon(rectangle: IntRect) -> MvtPolygon {
 /// This compacts in place: the caller hands over its vector, so a tile's worth
 /// of rectangles is never copied just to be sorted.
 fn merge_horizontal_runs(rectangles: &mut Vec<IntRect>) {
-    rectangles.sort_unstable_by_key(|rectangle| (rectangle.y1, rectangle.y2, rectangle.x1));
+    rectangles.sort_unstable_by_key(|rectangle| run_sort_key(*rectangle));
 
     let mut kept = 0usize;
     for read in 0..rectangles.len() {
@@ -189,6 +222,21 @@ fn merge_horizontal_runs(rectangles: &mut Vec<IntRect>) {
 
 #[inline]
 fn add_interval(active: &mut Vec<(i32, i32, u32)>, x1: i32, x2: i32) {
+    // The sweep opens bands in ascending (x1, x2) order within a line, so the
+    // common case appends to the end. Both others keep the sorted invariant.
+    if let Some(last) = active.last_mut() {
+        if (x1, x2) == (last.0, last.1) {
+            last.2 += 1;
+            return;
+        }
+        if (x1, x2) > (last.0, last.1) {
+            active.push((x1, x2, 1));
+            return;
+        }
+    } else {
+        active.push((x1, x2, 1));
+        return;
+    }
     match active.binary_search_by(|probe| (probe.0, probe.1).cmp(&(x1, x2))) {
         Ok(index) => active[index].2 += 1,
         Err(index) => active.insert(index, (x1, x2, 1)),
@@ -197,6 +245,15 @@ fn add_interval(active: &mut Vec<(i32, i32, u32)>, x1: i32, x2: i32) {
 
 #[inline]
 fn remove_interval(active: &mut Vec<(i32, i32, u32)>, x1: i32, x2: i32) {
+    if let Some(last) = active.last_mut()
+        && (last.0, last.1) == (x1, x2)
+    {
+        last.2 -= 1;
+        if last.2 == 0 {
+            active.pop();
+        }
+        return;
+    }
     let Ok(index) = active.binary_search_by(|probe| (probe.0, probe.1).cmp(&(x1, x2))) else {
         debug_assert!(false, "every end event matches a start event");
         return;
@@ -254,15 +311,45 @@ fn add_horizontal_edges(
     }
 }
 
+/// The ends of a vertex's outgoing-edge chain, in edge order.
+///
+/// The chain links two consecutive edges through `next`, so one insertion per
+/// edge builds it - no second lookup to place the edge in a flat array, which
+/// the tracer used to pay for every edge of every boundary.
+struct VertexChain {
+    head: u32,
+    tail: u32,
+}
+
+const NO_EDGE: u32 = u32::MAX;
+
 fn trace_contours(edges: &[Edge]) -> Result<Vec<MvtLineString>> {
-    // One entry per vertex, which is a little under one per edge.
-    let mut outgoing =
-        HashMap::<(i32, i32), Vec<usize>>::with_capacity_and_hasher(edges.len(), <_>::default());
+    ensure!(
+        edges.len() <= NO_EDGE as usize,
+        "rectangle union produced too many edges at once"
+    );
+    // The tracer needs the outgoing edges of a vertex twice per edge - once to
+    // record it and once to follow it - and most vertices have exactly one.
+    // A `Vec` per vertex used to be a heap allocation per edge; a chain of
+    // index links is one map entry per vertex and one array slot per edge.
+    let mut vertices =
+        HashMap::<(i32, i32), VertexChain>::with_capacity_and_hasher(edges.len(), <_>::default());
+    let mut next = vec![NO_EDGE; edges.len()];
     for (index, edge) in edges.iter().enumerate() {
-        outgoing
-            .entry((edge.start.x, edge.start.y))
-            .or_default()
-            .push(index);
+        let index = index as u32;
+        match vertices.entry((edge.start.x, edge.start.y)) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let chain = entry.get_mut();
+                next[chain.tail as usize] = index;
+                chain.tail = index;
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(VertexChain {
+                    head: index,
+                    tail: index,
+                });
+            }
+        }
     }
 
     let mut visited = vec![false; edges.len()];
@@ -273,7 +360,7 @@ fn trace_contours(edges: &[Edge]) -> Result<Vec<MvtLineString>> {
         }
         let first = edges[first_index];
         // Rings are short, so one allocation up front covers almost all of them.
-        let mut points = Vec::with_capacity(16);
+        let mut points = Vec::with_capacity(8);
         points.push(first.start);
         let mut edge_index = first_index;
         loop {
@@ -287,15 +374,27 @@ fn trace_contours(edges: &[Edge]) -> Result<Vec<MvtLineString>> {
                 break;
             }
 
-            let candidates = outgoing
+            let chain = vertices
                 .get(&(edge.end.x, edge.end.y))
                 .ok_or_else(|| anyhow::anyhow!("rectangle union produced an open boundary"))?;
-            let next_index = candidates
-                .iter()
-                .copied()
-                .filter(|&index| !visited[index])
-                .min_by_key(|&index| turn_priority(edge.direction, edges[index].direction))
-                .ok_or_else(|| anyhow::anyhow!("rectangle union produced an open boundary"))?;
+            let mut next_index = NO_EDGE;
+            let mut best_priority = u8::MAX;
+            let mut candidate = chain.head;
+            while candidate != NO_EDGE {
+                if !visited[candidate as usize] {
+                    let priority =
+                        turn_priority(edge.direction, edges[candidate as usize].direction);
+                    if priority < best_priority {
+                        best_priority = priority;
+                        next_index = candidate;
+                    }
+                }
+                candidate = next[candidate as usize];
+            }
+            if next_index == NO_EDGE {
+                return Err(anyhow::anyhow!("rectangle union produced an open boundary"));
+            }
+            let next_index = next_index as usize;
             if edges[next_index].direction != edge.direction {
                 points.push(edge.end);
             }
@@ -347,12 +446,12 @@ fn contours_to_polygons(contours: Vec<MvtLineString>) -> Result<Vec<MvtPolygon>>
     let mut polygons = Vec::<Ring>::new();
     let mut holes = Vec::new();
     for contour in contours {
-        let area = signed_area(&contour);
+        let (area, bounds) = area_and_bounds(&contour);
         ensure!(area != 0, "rectangle union produced a zero-area ring");
         if area > 0 {
             polygons.push(Ring {
                 area,
-                bounds: bounds(&contour),
+                bounds,
                 exterior: contour,
                 interiors: Vec::new(),
             });
@@ -379,27 +478,22 @@ fn contours_to_polygons(contours: Vec<MvtLineString>) -> Result<Vec<MvtPolygon>>
         .collect())
 }
 
-/// Returns the `[x1, y1, x2, y2]` bounds of a ring.
-fn bounds(ring: &MvtLineString) -> [i32; 4] {
+/// The doubled signed area and the `[x1, y1, x2, y2]` bounds of a ring, in
+/// one pass: every point is read two or three times otherwise.
+fn area_and_bounds(ring: &MvtLineString) -> (i64, [i32; 4]) {
     let mut bounds = [i32::MAX, i32::MAX, i32::MIN, i32::MIN];
+    let mut area = 0i64;
+    let mut previous = ring.0[ring.0.len() - 1];
     for point in &ring.0 {
+        area +=
+            i64::from(previous.x) * i64::from(point.y) - i64::from(previous.y) * i64::from(point.x);
+        previous = *point;
         bounds[0] = bounds[0].min(point.x);
         bounds[1] = bounds[1].min(point.y);
         bounds[2] = bounds[2].max(point.x);
         bounds[3] = bounds[3].max(point.y);
     }
-    bounds
-}
-
-fn signed_area(ring: &MvtLineString) -> i64 {
-    ring.0
-        .iter()
-        .zip(ring.0.iter().cycle().skip(1))
-        .take(ring.0.len())
-        .map(|(left, right)| {
-            i64::from(left.x) * i64::from(right.y) - i64::from(left.y) * i64::from(right.x)
-        })
-        .sum()
+    (area, bounds)
 }
 
 /// Casts a ray to the left of `point`. Every ring here is rectilinear, so only
@@ -423,8 +517,12 @@ mod tests {
         polygons
             .iter()
             .map(|polygon| {
-                signed_area(polygon.exterior())
-                    + polygon.interiors().iter().map(signed_area).sum::<i64>()
+                area_and_bounds(polygon.exterior()).0
+                    + polygon
+                        .interiors()
+                        .iter()
+                        .map(|ring| area_and_bounds(ring).0)
+                        .sum::<i64>()
             })
             .sum::<i64>()
             / 2
