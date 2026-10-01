@@ -115,15 +115,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
-name = "bitstream-io"
-version = "4.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7eff00be299a18769011411c9def0d827e8f2d7bf0c3dbf53633147a8867fd1f"
-dependencies = [
- "no_std_io2",
-]
-
-[[package]]
 name = "buffa"
 version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -560,15 +551,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "no_std_io2"
-version = "0.9.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "418abd1b6d34fbf6cae440dc874771b0525a604428704c76e48b29a5e67b8003"
-dependencies = [
- "memchr",
-]
-
-[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -829,9 +811,8 @@ dependencies = [
 [[package]]
 name = "tinygrib2"
 version = "0.1.0"
-source = "git+https://github.com/ciscorn/tinygrib2.git#bd724c961d6de91bdae0d01adb7ae61730fc7a13"
+source = "git+https://github.com/ciscorn/tinygrib2.git#315a3638ff1fe321e80e2102aeb56d38f11b57cd"
 dependencies = [
- "bitstream-io",
  "byteorder",
  "itertools",
  "thiserror",
