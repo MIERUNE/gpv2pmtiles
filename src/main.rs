@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use grib2pmtiles::{ConvertOptions, convert};
+use gpv2pmtiles::{ConvertOptions, convert};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
