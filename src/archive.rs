@@ -520,7 +520,7 @@ fn write_archive(
         TileOutput::Raster(_) => (TileType::Png, Compression::None),
     };
     let mut writer = PmTilesWriter::new(tile_type)
-        .tile_compression(tile_compression)
+        .precompressed(tile_compression)
         .min_zoom(min_zoom)
         .max_zoom(max_zoom)
         .bounds(bounds[0], bounds[1], bounds[2], bounds[3])
@@ -562,7 +562,7 @@ fn write_archive(
         }
         tiles.sort_unstable_by_key(|(zxy, _)| *zxy);
         for ((z, x, y), encoded_tile) in tiles {
-            writer.add_raw_tile(TileCoord::new(z, x, y)?, &encoded_tile)?;
+            writer.add_tile(TileCoord::new(z, x, y)?, &encoded_tile)?;
         }
 
         producer

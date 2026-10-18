@@ -50,7 +50,7 @@ pub(super) fn render_mvt_layer(
     value_geom.sort_unstable_by_key(|(values, _)| *values);
 
     // Encode features
-    let mut layer = MvtLayerBuilder::with_capacity(layer_name, value_geom.len())?;
+    let mut layer = MvtLayerBuilder::new(layer_name)?;
     layer.extent(std::num::NonZeroU32::new(layout.extent).expect("MVT extent is positive"));
     for (values, geometry) in value_geom {
         let mut feature = layer.feature(&geometry)?;
