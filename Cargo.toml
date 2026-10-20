@@ -11,6 +11,10 @@ publish = false
 members = ["crates/*"]
 resolver = "3"
 
+[features]
+default = ["zlib-rs"]
+zlib-rs = ["flate2/zlib-rs"]
+
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }

@@ -108,7 +108,6 @@ pub(super) fn union_rectangles(mut rectangles: Vec<IntRect>) -> Result<Vec<MvtPo
     let mut covered_below = Vec::<(i32, i32)>::new();
     // A band contributes a pair of vertical edges and its two horizontal ends.
     let mut edges = Vec::<Edge>::with_capacity(bands.len().saturating_mul(4));
-    let mut xs = Vec::<i32>::new();
     let mut band_start_y = 0;
 
     let (mut start_index, mut end_index) = (0, 0);
@@ -161,7 +160,7 @@ pub(super) fn union_rectangles(mut rectangles: Vec<IntRect>) -> Result<Vec<MvtPo
                 MvtCoord { x: x2, y },
             ));
         }
-        add_horizontal_edges(y, &covered_above, &covered_below, &mut edges, &mut xs);
+        add_horizontal_edges(y, &covered_above, &covered_below, &mut edges);
         std::mem::swap(&mut covered_above, &mut covered_below);
         band_start_y = y;
     }
@@ -197,9 +196,23 @@ fn rectangle_polygon(rectangle: IntRect) -> MvtPolygon {
 /// Sorts the rectangles by row and merges the ones that share a row and touch,
 /// so that each row is left with disjoint intervals in ascending order.
 ///
-/// This compacts in place: the caller hands over its vector, so a tile's worth
-/// of rectangles is never copied just to be sorted.
+/// Compact coordinate ranges use integer sort keys; only surviving runs are
+/// decoded. Wide coordinates retain the general in-place comparison sort.
 fn merge_horizontal_runs(rectangles: &mut Vec<IntRect>) {
+    // Four coordinates fit in a u64 when their span needs at most 16 bits.
+    // Keep the general comparator for wide extents and coordinate ranges.
+    let min = rectangles.iter().map(|r| r.x1.min(r.y1)).min().unwrap_or(0);
+    let max = rectangles
+        .iter()
+        .map(|r| r.x2.max(r.y2))
+        .max()
+        .unwrap_or(min);
+    let span = (i64::from(max) - i64::from(min)) as u64;
+    let bits = (u64::BITS - span.leading_zeros()).max(1);
+    if bits <= 16 {
+        merge_packed_runs(rectangles, min, bits);
+        return;
+    }
     rectangles.sort_unstable_by_key(|rectangle| run_sort_key(*rectangle));
 
     let mut kept = 0usize;
@@ -216,6 +229,47 @@ fn merge_horizontal_runs(rectangles: &mut Vec<IntRect>) {
             rectangles[kept] = rectangle;
             kept += 1;
         }
+    }
+    rectangles.truncate(kept);
+}
+
+/// Sort compact integer keys, then decode only the surviving horizontal runs.
+fn merge_packed_runs(rectangles: &mut Vec<IntRect>, offset: i32, bits: u32) {
+    let mask = (1u64 << bits) - 1;
+    let coordinate = |value: i32| (i64::from(value) - i64::from(offset)) as u64;
+    let mut packed = rectangles
+        .iter()
+        .map(|r| {
+            coordinate(r.y1) << (3 * bits)
+                | coordinate(r.y2) << (2 * bits)
+                | coordinate(r.x1) << bits
+                | coordinate(r.x2)
+        })
+        .collect::<Vec<_>>();
+    packed.sort_unstable();
+    let mut kept = 0;
+    for index in 0..packed.len() {
+        let key = packed[index];
+        if kept > 0
+            && packed[kept - 1] >> (2 * bits) == key >> (2 * bits)
+            && (key >> bits & mask) <= (packed[kept - 1] & mask)
+        {
+            packed[kept - 1] =
+                (packed[kept - 1] & !mask) | (packed[kept - 1] & mask).max(key & mask);
+        } else {
+            packed[kept] = key;
+            kept += 1;
+        }
+    }
+    let decode = |key: u64, shift| (i64::from(offset) + ((key >> shift) & mask) as i64) as i32;
+    for index in 0..kept {
+        let key = packed[index];
+        rectangles[index] = IntRect::new(
+            decode(key, bits),
+            decode(key, 3 * bits),
+            decode(key, 0),
+            decode(key, 2 * bits),
+        );
     }
     rectangles.truncate(kept);
 }
@@ -278,36 +332,36 @@ fn merge_active(active: &[(i32, i32, u32)], covered: &mut Vec<(i32, i32)>) {
     }
 }
 
-fn add_horizontal_edges(
-    y: i32,
-    above: &[(i32, i32)],
-    below: &[(i32, i32)],
-    edges: &mut Vec<Edge>,
-    xs: &mut Vec<i32>,
-) {
-    xs.clear();
-    xs.extend(above.iter().flat_map(|&(x1, x2)| [x1, x2]));
-    xs.extend(below.iter().flat_map(|&(x1, x2)| [x1, x2]));
-    xs.sort_unstable();
-    xs.dedup();
-
-    let mut above_index = 0;
-    let mut below_index = 0;
-    for segment in xs.windows(2) {
-        let (x1, x2) = (segment[0], segment[1]);
-        while above_index < above.len() && above[above_index].1 <= x1 {
-            above_index += 1;
+/// Merges two sorted endpoint streams; coverage toggles at each endpoint.
+/// This emits the same segments in the same order as sorting all endpoints.
+fn add_horizontal_edges(y: i32, above: &[(i32, i32)], below: &[(i32, i32)], edges: &mut Vec<Edge>) {
+    let mut above = above.iter().flat_map(|&(x1, x2)| [x1, x2]).peekable();
+    let mut below = below.iter().flat_map(|&(x1, x2)| [x1, x2]).peekable();
+    let (mut is_above, mut is_below) = (false, false);
+    while let Some(x1) = first_endpoint(above.peek(), below.peek()) {
+        while above.next_if_eq(&x1).is_some() {
+            is_above = !is_above;
         }
-        while below_index < below.len() && below[below_index].1 <= x1 {
-            below_index += 1;
+        while below.next_if_eq(&x1).is_some() {
+            is_below = !is_below;
         }
-        let is_above = above_index < above.len() && above[above_index].0 <= x1;
-        let is_below = below_index < below.len() && below[below_index].0 <= x1;
+        let Some(x2) = first_endpoint(above.peek(), below.peek()) else {
+            break;
+        };
         match (is_above, is_below) {
             (false, true) => edges.push(Edge::new(MvtCoord { x: x1, y }, MvtCoord { x: x2, y })),
             (true, false) => edges.push(Edge::new(MvtCoord { x: x2, y }, MvtCoord { x: x1, y })),
             _ => {}
         }
+    }
+}
+
+#[inline]
+fn first_endpoint(left: Option<&i32>, right: Option<&i32>) -> Option<i32> {
+    match (left, right) {
+        (Some(&left), Some(&right)) => Some(left.min(right)),
+        (Some(&value), None) | (None, Some(&value)) => Some(value),
+        (None, None) => None,
     }
 }
 
@@ -512,6 +566,81 @@ fn contains(ring: &MvtLineString, point: MvtCoord) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_run_sort_matches_the_general_sort_at_signed_and_bit_boundaries() {
+        for offset in [i32::MIN, -65536, -32, 0, i32::MAX - 65535] {
+            let mut rectangles = vec![
+                IntRect::new(offset + 1, offset, offset + 3, offset + 2),
+                IntRect::new(offset, offset, offset + 1, offset + 2),
+                IntRect::new(offset + 3, offset, offset + 5, offset + 2),
+                IntRect::new(offset, offset, offset + 4, offset + 2),
+                IntRect::new(offset, offset + 2, offset + 65535, offset + 65535),
+            ];
+            let mut expected = rectangles.clone();
+            expected.sort_unstable_by_key(|r| {
+                run_sort_key(IntRect::new(
+                    r.x1 - offset,
+                    r.y1 - offset,
+                    r.x2 - offset,
+                    r.y2 - offset,
+                ))
+            });
+            let mut result = Vec::<IntRect>::new();
+            for r in expected {
+                if let Some(last) = result.last_mut()
+                    && last.y1 == r.y1
+                    && last.y2 == r.y2
+                    && r.x1 <= last.x2
+                {
+                    last.x2 = last.x2.max(r.x2);
+                } else {
+                    result.push(r);
+                }
+            }
+            merge_horizontal_runs(&mut rectangles);
+            assert_eq!(rectangles, result);
+        }
+        let mut wide = vec![
+            IntRect::new(0, 0, 40000, 1),
+            IntRect::new(40000, 0, 70000, 1),
+        ];
+        merge_horizontal_runs(&mut wide);
+        assert_eq!(wide, [IntRect::new(0, 0, 70000, 1)]);
+    }
+
+    #[test]
+    fn horizontal_edges_merge_overlapping_and_touching_intervals_in_order() {
+        let mut edges = Vec::new();
+        add_horizontal_edges(3, &[(0, 2), (4, 8)], &[(1, 5), (7, 9)], &mut edges);
+        let coordinates = edges
+            .iter()
+            .map(|edge| (edge.start.x, edge.start.y, edge.end.x, edge.end.y))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            coordinates,
+            [(1, 3, 0, 3), (2, 3, 4, 3), (7, 3, 5, 3), (8, 3, 9, 3)]
+        );
+
+        edges.clear();
+        add_horizontal_edges(0, &[(0, 2)], &[(2, 4)], &mut edges);
+        assert_eq!(edges.len(), 2);
+        assert_eq!((edges[0].start.x, edges[0].end.x), (2, 0));
+        assert_eq!((edges[1].start.x, edges[1].end.x), (2, 4));
+    }
+
+    #[test]
+    fn horizontal_edges_handle_empty_equal_and_extreme_coordinates() {
+        let mut edges = Vec::new();
+        add_horizontal_edges(0, &[], &[(i32::MIN, -1), (0, i32::MAX)], &mut edges);
+        assert_eq!(edges.len(), 2);
+        assert_eq!((edges[0].start.x, edges[0].end.x), (i32::MIN, -1));
+        assert_eq!((edges[1].start.x, edges[1].end.x), (0, i32::MAX));
+        edges.clear();
+        add_horizontal_edges(0, &[(1, 2)], &[(1, 2)], &mut edges);
+        add_horizontal_edges(0, &[], &[], &mut edges);
+        assert!(edges.is_empty());
+    }
 
     fn area(polygons: &[MvtPolygon]) -> i64 {
         polygons

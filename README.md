@@ -1,6 +1,6 @@
 # gpv2pmtiles
 
-気象庁のGPVデータ (GRIB2形式) を直接ベクタータイル (PMTilesアーカイブ) に変換するデモです。
+気象庁のGPVデータ (GRIB2形式) をベクタータイルセット (PMTiles形式) に高速変換するデモです。
 
 `gpv2pmtiles` directly converts GPV data (GRIB2) provided by the Japan Meteorological Agency (JMA) into a vector tileset (PMTiles) at lightning speed.
 
