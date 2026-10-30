@@ -273,6 +273,7 @@ mod tests {
             rectangles_past_every_edge(MvtLayout {
                 extent: 256,
                 buffer: 1,
+                ..Default::default()
             }),
             [IntRect::new(-1, -1, 257, 257)]
         );
@@ -308,6 +309,7 @@ mod tests {
         let layout = MvtLayout {
             extent: 256,
             buffer: 1,
+            ..Default::default()
         };
 
         let bytes = render_mvt_layer("dosha", &spec, layout, &TILE, &points, &scales)

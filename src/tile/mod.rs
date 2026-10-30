@@ -1,5 +1,8 @@
+mod detail;
 mod mvt;
 mod raster;
+
+pub(crate) use detail::DetailSchedule;
 
 pub(crate) use raster::{
     ColorEncoding, IMAGE_EXTENT as RASTER_IMAGE_EXTENT, RangeReport,
@@ -382,6 +385,8 @@ pub(crate) struct MvtLayout {
     /// Geometry kept beyond each edge, in 1/256ths of the tile width - the
     /// pixels of a 256px tile, as tippecanoe counts them.
     pub(crate) buffer: u32,
+    /// How coarsely cells are merged at each zoom; see [`detail`].
+    pub(crate) detail: DetailSchedule,
 }
 
 impl Default for MvtLayout {
@@ -389,6 +394,7 @@ impl Default for MvtLayout {
         Self {
             extent: 4096,
             buffer: 2,
+            detail: DetailSchedule::default(),
         }
     }
 }
@@ -444,7 +450,21 @@ pub(crate) fn make_layer(
 
     let aggregation = product.spec.aggregation;
     let band_count = product.spec.band_specs.len();
-    let aggregation_scale = maximum_detail_zoom.saturating_sub(z);
+    let aggregation_scale = match output {
+        TileOutput::Mvt(layout) => detail::mvt_aggregation_scale(
+            maximum_detail_zoom,
+            z,
+            layout.detail.at(z),
+            (
+                product.spec.grid_spec.lng_denom,
+                product.spec.grid_spec.lat_denom,
+            ),
+            layout.extent,
+        ),
+        TileOutput::Raster(_) => {
+            detail::aggregation_scale(maximum_detail_zoom, z, detail::DEFAULT_DETAIL)
+        }
+    };
     let aggregation_width = 1u32 << aggregation_scale;
     let aggregation_mask = !(aggregation_width - 1);
     let grid = &product.spec.grid_spec;

@@ -18,7 +18,8 @@ use crate::{
     model::PreparedProduct,
     prepare, quantize,
     tile::{
-        ColorEncoding, MvtLayout, TileContext, TileOutput, Zxy, make_layer, zxy_to_chunk_id_range,
+        ColorEncoding, DetailSchedule, MvtLayout, TileContext, TileOutput, Zxy, make_layer,
+        zxy_to_chunk_id_range,
     },
 };
 
@@ -44,6 +45,9 @@ pub struct ConvertOptions {
     /// MVT geometry kept beyond each tile edge, in 1/256ths of the tile width.
     /// Defaults to 2.
     pub buffer: Option<u32>,
+    /// How coarsely cells are merged at each zoom, as `<detail>` or
+    /// `<zoom>:<detail>,...`. Defaults to 8 at every zoom.
+    pub detail: Option<String>,
     /// Emit RGBA raster tiles with this colour encoding instead of MVT.
     pub raster: Option<String>,
     /// Write an index of the raster archives to this path.
@@ -69,6 +73,7 @@ impl Default for ConvertOptions {
             omit_zero: false,
             extent: None,
             buffer: None,
+            detail: None,
             raster: None,
             manifest: None,
             skip_analysis: false,
@@ -153,6 +158,10 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
             TileOutput::Mvt(MvtLayout {
                 extent: options.extent.unwrap_or(default.extent),
                 buffer: options.buffer.unwrap_or(default.buffer),
+                detail: match &options.detail {
+                    Some(spec) => spec.parse::<DetailSchedule>()?,
+                    None => default.detail,
+                },
             })
         }
     };
@@ -646,9 +655,13 @@ fn validate_options(options: &ConvertOptions) -> Result<()> {
             "--buffer must not exceed {MAX_MVT_BUFFER}, a whole tile width"
         );
     }
+    if let Some(spec) = &options.detail {
+        spec.parse::<DetailSchedule>()?;
+    }
     ensure!(
-        options.raster.is_none() || (options.extent.is_none() && options.buffer.is_none()),
-        "--extent and --buffer apply to MVT output, not to --raster"
+        options.raster.is_none()
+            || (options.extent.is_none() && options.buffer.is_none() && options.detail.is_none()),
+        "--extent, --buffer and --detail apply to MVT output, not to --raster"
     );
     ensure!(
         options.manifest.is_none() || options.raster.is_some(),
@@ -1397,6 +1410,31 @@ mod tests {
             ..Default::default()
         };
         validate_options(&options).unwrap();
+    }
+
+    #[test]
+    fn detail_is_checked_with_the_other_options() {
+        let options = ConvertOptions {
+            detail: Some("5:8,1:9".into()),
+            ..Default::default()
+        };
+        assert!(validate_options(&options).is_err());
+
+        let options = ConvertOptions {
+            detail: Some("1:9,5:8,9:12".into()),
+            ..Default::default()
+        };
+        validate_options(&options).unwrap();
+    }
+
+    #[test]
+    fn detail_is_refused_for_raster_output() {
+        let options = ConvertOptions {
+            raster: Some("scalar16:0,1".into()),
+            detail: Some("9".into()),
+            ..Default::default()
+        };
+        assert!(validate_options(&options).is_err());
     }
 
     #[test]

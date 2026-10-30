@@ -51,6 +51,21 @@ struct Cli {
     #[arg(long, value_name = "PIXELS")]
     buffer: Option<u32>,
 
+    /// How coarsely MVT grid cells are merged at each zoom, as the log2 of the
+    /// resolution a merged block approaches: at 8 a block is about 1/256 of
+    /// the tile across, at 9 about 1/512. Give one value for every zoom, or
+    /// stops as <ZOOM>:<DETAIL>,... where each holds until the next, such as
+    /// 1:9,5:8,9:12. Blocks are a power of two cells across, so the size is
+    /// the nearest one to the request. Only values from 8 to 30 are accepted,
+    /// so blocks can be made finer than the default but not coarser. Raising
+    /// the detail stops short of blocks narrower than one unit of --extent,
+    /// which would round away with their value, so the extent limits how fine
+    /// a detail takes effect; at the default extent that is about detail 11.
+    /// The default blocks are kept as they are even when a small --extent
+    /// makes them narrower than a unit. [default: 8]
+    #[arg(long, value_name = "SPEC")]
+    detail: Option<String>,
+
     /// Drop products that are analyses rather than forecasts. Nowcast inputs
     /// lead with the observed field, valid at the reference time itself, which
     /// otherwise becomes the first layer.
@@ -151,6 +166,7 @@ fn main() -> Result<()> {
             omit_zero: cli.omit_zero,
             extent: cli.extent,
             buffer: cli.buffer,
+            detail: cli.detail,
             raster: cli.raster,
             manifest: cli.manifest,
             skip_analysis: cli.skip_analysis,
