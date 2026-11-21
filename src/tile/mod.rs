@@ -438,7 +438,8 @@ fn weighted_blocks(
         .collect::<Vec<_>>();
     runs.par_sort_unstable_by_key(|&(key, ..)| key);
 
-    runs.par_chunk_by(|left, right| left.0 == right.0)
+    let blocks = runs
+        .par_chunk_by(|left, right| left.0 == right.0)
         .map_init(<[reduce::BlockSamples; 4]>::default, |samples, block| {
             let key = block[0].0;
             let (grid_x, grid_y) = ((key >> 32) as u32, key as u32);
@@ -506,7 +507,12 @@ fn weighted_blocks(
             ))
         })
         .flatten()
-        .collect()
+        .collect::<Vec<_>>();
+    // Sized up front: grown as it fills, the map rehashed every block of a
+    // low-zoom tile several times over.
+    let mut points = PointMap::with_capacity_and_hasher(blocks.len(), Default::default());
+    points.extend(blocks);
+    points
 }
 
 /// Measures a product's source values against the range an encoding can hold.
