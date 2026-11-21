@@ -755,6 +755,180 @@ pub(super) fn render_raster_tile(
     Ok(Some(encode_png(&pixels, layout.image_size())?))
 }
 
+/// Use a product-wide latitude limit so neighbouring tiles choose the same
+/// resampling rule, including their shared margin. Both native axes must be
+/// finer than one pixel; other zooms retain native-grid interpolation.
+pub(super) fn uses_pixel_aggregation(spec: &TilesetSpec, zxy: Zxy, tile_size: u32) -> bool {
+    let across = f64::from(tile_size) * f64::from(1u32 << zxy.0);
+    let grid = &spec.grid_spec;
+    let lat = spec.bounds[1]
+        .abs()
+        .max(spec.bounds[3].abs())
+        .min(85.0511287798066);
+    let dy = 0.5 / f64::from(grid.lat_denom);
+    let pixel_height = (crate::geo::lat_to_web_mercator_y(lat - dy)
+        - crate::geo::lat_to_web_mercator_y(lat + dy))
+    .abs()
+        * across;
+    across / (360.0 * f64::from(grid.lng_denom)) <= 1.0 && pixel_height <= 1.0
+}
+
+/// Assigns the centres of the virtual basic cells to globally anchored pixels.
+/// Coarse source cells are counted by intersections of integer ranges, without
+/// expanding them into basic cells. These are approximate grid-area statistics,
+/// not exact ground-area averages or exact polygon/pixel intersections.
+pub(super) fn render_pixel_tile(
+    product: &crate::model::PreparedProduct,
+    zxy: Zxy,
+    chunks: &[&[(u64, crate::model::BaseTile)]],
+    scales: &[BandScale<'_>],
+    layout: RasterLayout,
+    work: &mut super::reduce::Workspace,
+) -> Result<Option<Vec<u8>>> {
+    use super::reduce::Accumulator;
+    let encoding = layout.encoding;
+    let spec = &product.spec;
+    let grid = &spec.grid_spec;
+    let (z, tile_x, tile_y) = zxy;
+    let size = layout.image_size() as usize;
+    let world = f64::from(layout.size) * f64::from(1u32 << z);
+    let left = f64::from(tile_x) * f64::from(layout.size) - f64::from(TILE_BUFFER);
+    let top = f64::from(tile_y) * f64::from(layout.size) - f64::from(TILE_BUFFER);
+    let bands = encoding.bands();
+    let method = spec.reducer;
+    let ceil = |value: f64| value.ceil() as i64;
+    let floor = |value: f64| value.floor() as i64;
+    // Every cut is computed from the global pixel index, so adjacent tiles
+    // use identical memberships, capacities, and bytes in the shared margin.
+    let xcuts: [Vec<i64>; 3] = std::array::from_fn(|shift| {
+        (0..=size)
+            .map(|c| {
+                let lon = (left + c as f64) / world * 360.0 - 180.0 + (shift as f64 - 1.0) * 360.0;
+                ceil((lon - grid.lng_0) * f64::from(grid.lng_denom))
+            })
+            .collect()
+    });
+    let ycuts: Vec<i64> = (0..=size)
+        .map(|r| {
+            let lat = web_mercator_to_lnglat(0.0, (top + r as f64) / world).1;
+            floor((lat - grid.lat_0) * f64::from(grid.lat_denom)) + 1
+        })
+        .collect();
+    struct Pixel {
+        states: [Accumulator; 2],
+        capacity: u64,
+        method: super::reduce::Reducer,
+    }
+    let mut pixels: PointMap<usize, Pixel> = PointMap::default();
+    let overlap = |a: i64, b: i64, lo: i64, hi: i64| (b.min(hi) - a.max(lo)).max(0) as u64;
+    let square = super::ChunkSquare::read_by(spec.base_z, zxy, super::TileOutput::Raster(layout));
+    let mut read = chunks
+        .iter()
+        .flat_map(|chunk| chunk.iter())
+        .collect::<Vec<_>>();
+    read.sort_unstable_by_key(|(id, _)| *id);
+    read.dedup_by_key(|(id, _)| *id);
+    for &(id, tile) in &read {
+        let corner = fast_hilbert::h2xy::<u32>(*id, spec.base_z);
+        for (i, &(x, y)) in tile.point_positions.iter().enumerate() {
+            if !super::owns_cell(square, corner, tile, i) {
+                continue;
+            }
+            // Both components must describe the same support.
+            if (0..bands).any(|b| tile.bands[b].values[i].get().is_none()) {
+                continue;
+            }
+            let width = 1i64 << tile.point_powers[i];
+            let (x, y) = (i64::from(x), i64::from(y));
+            let longitude = |x: i64| grid.lng_0 + x as f64 / f64::from(grid.lng_denom);
+            let latitude = |y: i64| grid.lat_0 + y as f64 / f64::from(grid.lat_denom);
+            let row0 = (crate::geo::lat_to_web_mercator_y(latitude(y + width - 1)) * world - top)
+                .floor() as i64
+                - 1;
+            let row1 =
+                (crate::geo::lat_to_web_mercator_y(latitude(y)) * world - top).floor() as i64 + 1;
+            let row0 = row0.max(0) as usize;
+            let row1 = row1.min(size as i64 - 1);
+            if row1 < row0 as i64 {
+                continue;
+            }
+            for (shift, cuts) in xcuts.iter().enumerate() {
+                let offset = (shift as f64 - 1.0) * world;
+                let col0 =
+                    (((longitude(x) + 180.0) / 360.0) * world - offset - left).floor() as i64 - 1;
+                let col1 = (((longitude(x + width - 1) + 180.0) / 360.0) * world - offset - left)
+                    .floor() as i64
+                    + 1;
+                let col0 = col0.max(0) as usize;
+                let col1 = col1.min(size as i64 - 1);
+                if col1 < col0 as i64 {
+                    continue;
+                }
+                for row in row0..=row1 as usize {
+                    let ny = overlap(y, y + width, ycuts[row + 1], ycuts[row]);
+                    if ny == 0 {
+                        continue;
+                    }
+                    for col in col0..=col1 as usize {
+                        let nx = overlap(x, x + width, cuts[col], cuts[col + 1]);
+                        if nx == 0 {
+                            continue;
+                        }
+                        let capacity = ((cuts[col + 1] - cuts[col]).max(0) as u64)
+                            * ((ycuts[row] - ycuts[row + 1]).max(0) as u64);
+                        let pixel = pixels.entry(row * size + col).or_insert_with(|| Pixel {
+                            states: std::array::from_fn(|_| Accumulator::default()),
+                            capacity,
+                            method: super::reduce::effective_reducer(method, capacity),
+                        });
+                        for b in 0..bands {
+                            pixel.states[b].add(
+                                tile.bands[b].values[i].get().unwrap(),
+                                nx * ny,
+                                pixel.method,
+                                work,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut rgba = encoding.off_grid().repeat(size * size);
+    let mut covered = false;
+    for (index, pixel) in pixels {
+        let mut values = [0.0; 2];
+        let mut present = true;
+        for b in 0..bands {
+            let value = pixel.states[b]
+                .finish(pixel.method, pixel.capacity, spec.fill[b], work)
+                .and_then(|raw| finish_raw(raw, b, spec, &scales[b]));
+            if let Some(value) = value {
+                values[b] = value;
+            } else {
+                present = false;
+            }
+        }
+        if present {
+            rgba[index * 4..index * 4 + 4].copy_from_slice(&encoding.encode(values));
+            covered = true;
+        }
+    }
+    if !covered {
+        return Ok(None);
+    }
+    Ok(Some(encode_png(&rgba, layout.image_size())?))
+}
+
+fn finish_raw(raw: f64, b: usize, spec: &TilesetSpec, scale: &BandScale<'_>) -> Option<f64> {
+    let value = crate::quantize::postprocess(raw, b, spec)?;
+    Some(if scale.is_quantized() {
+        scale.physical(value as i32)
+    } else {
+        (scale.reference + value * scale.binary_scale) * scale.decimal_scale
+    })
+}
+
 fn encode_png(pixels: &[u8], image_size: u32) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     let mut encoder = png::Encoder::new(&mut buffer, image_size, image_size);

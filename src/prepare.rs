@@ -4,7 +4,7 @@ use std::{
     path::Path,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use foldhash::HashMap;
 use gpv_products::{
     grib::GridSquareMessageReader,
@@ -58,7 +58,7 @@ pub(crate) fn read_products(
         .collect())
 }
 
-pub(crate) fn prepare_products(products: Vec<RawProduct>) -> Vec<PreparedProduct> {
+pub(crate) fn prepare_products(products: Vec<RawProduct>) -> Result<Vec<PreparedProduct>> {
     products
         .into_par_iter()
         .map(|product| prepare_product(product.product_id, product.data))
@@ -77,11 +77,23 @@ fn read_messages<R: Read>(
 pub(crate) fn prepare_product(
     product_id: GpvProductIdentifier,
     mut product_data: ProductData,
-) -> PreparedProduct {
+) -> Result<PreparedProduct> {
     let grid = product_data
         .grid
         .clone()
         .unwrap_or_else(|| product_id.grid().clone());
+    for point in &product_data.points {
+        ensure!(point.point_power <= 16, "source cell power exceeds 16");
+        let width = 1u32 << point.point_power;
+        ensure!(
+            u32::from(point.x) % width == 0 && u32::from(point.y) % width == 0,
+            "source cell origin is not aligned to its size"
+        );
+        ensure!(
+            usize::from(point.band_idx) < product_data.band_specs.len(),
+            "source band index out of range"
+        );
+    }
     product_data.points.par_iter_mut().for_each(|point| {
         point.point_id = xy2h(point.x as u32, point.y as u32, 16) as u32;
     });
@@ -126,11 +138,34 @@ pub(crate) fn prepare_product(
         .map(|&lat| lat_to_web_mercator_y(lat))
         .collect::<Vec<_>>();
 
+    let mut previous_end = 0u64;
     for point_bands in product_data
         .points
         .chunk_by(|left, right| left.point_id == right.point_id)
     {
         let point = point_bands.first().expect("point group is not empty");
+        let area = 1u64 << (2 * point.point_power);
+        let interval_start = u64::from(point.point_id) & !(area - 1);
+        ensure!(
+            interval_start >= previous_end,
+            "overlapping source cells at ({}, {})",
+            point.x,
+            point.y
+        );
+        previous_end = interval_start + area;
+        let mut band_values = [None; 4];
+        for band in point_bands {
+            ensure!(
+                band.point_power == point.point_power,
+                "different source cell sizes at the same origin"
+            );
+            let previous = &mut band_values[usize::from(band.band_idx)];
+            ensure!(
+                previous.is_none_or(|value| value == band.value),
+                "conflicting source values at the same origin"
+            );
+            *previous = Some(band.value);
+        }
         let width = 1 << point.point_power;
         let lng1 = lng_edge[point.x as usize];
         let lng2 = lng_edge[point.x as usize + width];
@@ -236,11 +271,11 @@ pub(crate) fn prepare_product(
         bounds: [min_lng, min_lat, max_lng, max_lat],
     };
 
-    PreparedProduct {
+    Ok(PreparedProduct {
         product_id,
         spec,
         chunks,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -282,7 +317,7 @@ mod tests {
             grid: None,
         };
 
-        let prepared = prepare_product(product_id, product_data);
+        let prepared = prepare_product(product_id, product_data).unwrap();
         let mut position_count = 0;
         for (_, tile) in &prepared.chunks {
             assert_eq!(tile.point_positions.len(), tile.point_powers.len());
@@ -322,7 +357,7 @@ mod tests {
             grid: Some(grid.clone()),
         };
 
-        let prepared = prepare_product(product_id, product_data);
+        let prepared = prepare_product(product_id, product_data).unwrap();
 
         assert_eq!(prepared.spec.grid_spec, grid);
         assert_eq!(prepared.spec.base_z, 7);

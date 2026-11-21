@@ -360,6 +360,23 @@ impl ChunkSquare {
     }
 }
 
+fn owns_cell(
+    square: ChunkSquare,
+    (column, row): (u32, u32),
+    tile: &crate::model::BaseTile,
+    index: usize,
+) -> bool {
+    let (dx, dy) = tile.point_homes[index];
+    if (dx, dy) == (0, 0) {
+        return true;
+    }
+    let home = (
+        (i64::from(column) + i64::from(dx)).rem_euclid(i64::from(square.across)) as u32,
+        (i64::from(row) + i64::from(dy)) as u32,
+    );
+    square.nearest(home) == (column, row)
+}
+
 /// Reduces the cells of a tile into blocks with a weighted [`Reducer`].
 ///
 /// Every cell is counted once, through [`ChunkSquare::nearest`], and weighs
@@ -394,19 +411,8 @@ fn weighted_blocks(
         (u64::from(u32::from(x) & mask) << 32) | u64::from(u32::from(y) & mask)
     };
     // Whether this copy of a cell is the one that counts.
-    let counts = |(column, row): (u32, u32), tile: &crate::model::BaseTile, index: usize| {
-        let (offset_x, offset_y) = tile.point_homes[index];
-        // Most copies are the cell's own, and every chunk read lies in the
-        // square, so those count without asking where the nearest one is.
-        if (offset_x, offset_y) == (0, 0) {
-            return true;
-        }
-        let home = (
-            (i64::from(column) + i64::from(offset_x)).rem_euclid(i64::from(square.across)) as u32,
-            (i64::from(row) + i64::from(offset_y)) as u32,
-        );
-        square.nearest(home) == (column, row)
-    };
+    let counts =
+        |corner, tile: &crate::model::BaseTile, index| owns_cell(square, corner, tile, index);
 
     // (block key, index into `read`, first cell, end of the run)
     let mut runs = read
@@ -467,11 +473,28 @@ fn weighted_blocks(
                 .enumerate()
                 .take(band_count)
             {
-                *value = CompactOptI32::new(band_samples.reduce(
-                    product.spec.reducer,
-                    capacity,
-                    product.spec.fill[band_index],
-                ));
+                *value = if product.spec.quantize[band_index].is_some()
+                    || product.spec.omit_zero[band_index].is_some()
+                {
+                    CompactOptI32::new(
+                        band_samples
+                            .reduce_fractional(
+                                product.spec.reducer,
+                                capacity,
+                                product.spec.fill[band_index],
+                            )
+                            .and_then(|raw| {
+                                crate::quantize::postprocess(raw, band_index, &product.spec)
+                            })
+                            .map(|raw| raw.round_ties_even() as i32),
+                    )
+                } else {
+                    CompactOptI32::new(band_samples.reduce(
+                        product.spec.reducer,
+                        capacity,
+                        product.spec.fill[band_index],
+                    ))
+                };
             }
             values.iter().any(|value| value.get().is_some()).then_some((
                 (grid_x, grid_y),
@@ -612,6 +635,20 @@ pub(crate) fn make_layer(
         return Ok(None);
     }
     let chunks = source_chunks(product, tile_context.zxy, output);
+    if let TileOutput::Raster(encoding) = output
+        && raster::uses_pixel_aggregation(&product.spec, tile_context.zxy, encoding.size)
+    {
+        return reduce::with_workspace(|work| {
+            raster::render_pixel_tile(
+                product,
+                tile_context.zxy,
+                &chunks,
+                &band_scales(product),
+                encoding,
+                work,
+            )
+        });
+    }
 
     let maximum_detail_zoom = (product.spec.grid_spec.lat_denom * 360.0 * 2.0 / 512.0)
         .log2()
@@ -664,11 +701,7 @@ pub(crate) fn make_layer(
             ),
             layout.extent,
         ),
-        // A smaller tile reaches the same pixels a zoom later, and is merged
-        // as the larger one is there; see `RasterLayout::zoom_offset`.
-        TileOutput::Raster(layout) => (i32::from(maximum_detail_zoom) - i32::from(z)
-            + i32::from(layout.zoom_offset()))
-        .max(0) as u8,
+        TileOutput::Raster(_) => 0,
     };
     let aggregation_width = 1u32 << aggregation_scale;
     let aggregation_mask = !(aggregation_width - 1);
@@ -810,33 +843,35 @@ pub(crate) fn make_layer(
         }
     }
 
-    // `--omit-zero` means physical zero, independently of any representative
-    // value chosen by quantization. Apply it while points still carry raw
-    // values so a positive value in a class that emits zero remains present.
-    if apply_omits(&mut points, &product.spec.omit_zero, band_count) {
-        return Ok(None);
-    }
+    if !(product.spec.reducer.is_weighted() && aggregation_scale > 0) {
+        // `--omit-zero` means physical zero, independently of any representative
+        // value chosen by quantization. Apply it while points still carry raw
+        // values so a positive value in a class that emits zero remains present.
+        if apply_omits(&mut points, &product.spec.omit_zero, band_count) {
+            return Ok(None);
+        }
 
-    // Quantize before the polygons are grouped, so that cells sharing a class
-    // merge into a single polygon. Doing it while encoding attributes would
-    // leave the geometry fragmented, which is where most of a tile's bytes are.
-    // It has to run after aggregation, or averages would be taken over values
-    // that were already coarsened.
-    if product.spec.quantize.iter().any(Option::is_some) {
-        for point in points.values_mut() {
-            for (index, quantize) in product.spec.quantize.iter().enumerate() {
-                if let Some(quantize) = quantize {
-                    point.values[index] = point.values[index]
-                        .map(|value| CompactOptI32::new(Some(quantize.class_of(value))));
+        // Quantize before the polygons are grouped, so that cells sharing a class
+        // merge into a single polygon. Doing it while encoding attributes would
+        // leave the geometry fragmented, which is where most of a tile's bytes are.
+        // It has to run after aggregation, or averages would be taken over values
+        // that were already coarsened.
+        if product.spec.quantize.iter().any(Option::is_some) {
+            for point in points.values_mut() {
+                for (index, quantize) in product.spec.quantize.iter().enumerate() {
+                    if let Some(quantize) = quantize {
+                        point.values[index] = point.values[index]
+                            .map(|value| CompactOptI32::new(Some(quantize.class_of(value))));
+                    }
                 }
             }
         }
-    }
 
-    // `--omit-class` targets the representative values of quantized classes,
-    // so it runs after raw values have become class indices.
-    if apply_omits(&mut points, &product.spec.omit_class, band_count) {
-        return Ok(None);
+        // `--omit-class` targets the representative values of quantized classes,
+        // so it runs after raw values have become class indices.
+        if apply_omits(&mut points, &product.spec.omit_class, band_count) {
+            return Ok(None);
+        }
     }
 
     let band_scales = band_scales(product);
@@ -969,7 +1004,7 @@ mod tests {
             generating_process: gpv_products::products::GeneratingProcessType::Forecast,
             ..Default::default()
         };
-        crate::prepare::prepare_product(product_id, product_data)
+        crate::prepare::prepare_product(product_id, product_data).unwrap()
     }
 
     /// Each block reduced straight from the cells, counting each once.

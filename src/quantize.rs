@@ -39,6 +39,12 @@ impl BandQuantize {
         above.saturating_sub(1) as i32
     }
 
+    pub(crate) fn class_of_physical(&self, value: f64) -> i32 {
+        self.bounds
+            .partition_point(|bound| *bound <= value)
+            .saturating_sub(1) as i32
+    }
+
     /// Physical value emitted for a class index produced by [`Self::class_of`].
     #[inline]
     pub fn output(&self, class: i32) -> f64 {
@@ -74,6 +80,39 @@ impl BandQuantize {
 
     pub fn outputs(&self) -> &[f64] {
         &self.outputs
+    }
+}
+
+/// Applies omissions and quantization to a completed statistic, preserving a
+/// fractional mean until it has been classified. Returns a class index for a
+/// quantized band, or the unchanged raw value otherwise.
+pub(crate) fn postprocess(raw: f64, index: usize, spec: &crate::model::TilesetSpec) -> Option<f64> {
+    if spec.omit_zero[index]
+        .as_ref()
+        .is_some_and(|omit| omit.contains_fractional(raw))
+    {
+        return None;
+    }
+    if let Some(quantize) = &spec.quantize[index] {
+        let class = if raw.fract() == 0.0 {
+            quantize.class_of(raw as i32)
+        } else {
+            let band = &spec.band_specs[index];
+            let physical = (f64::from(band.reference_value)
+                + raw * 2f64.powi(i32::from(band.binary_scale)))
+                * 10f64.powi(-i32::from(band.decimal_scale));
+            quantize.class_of_physical(physical)
+        };
+        if spec.omit_class[index]
+            .as_ref()
+            .is_some_and(|omit| omit.contains(class))
+        {
+            None
+        } else {
+            Some(f64::from(class))
+        }
+    } else {
+        Some(raw)
     }
 }
 
@@ -245,6 +284,10 @@ impl BandOmit {
     #[inline]
     pub fn contains(&self, stored: i32) -> bool {
         self.stored.contains(&stored)
+    }
+
+    pub(crate) fn contains_fractional(&self, raw: f64) -> bool {
+        self.stored.iter().any(|&v| f64::from(v) == raw)
     }
 
     pub fn physical(&self) -> &[f64] {

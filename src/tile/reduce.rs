@@ -72,7 +72,7 @@ impl FromStr for Reducer {
             "min" => Self::Legacy(Aggregation::Min),
             "rough-avg" => Self::Legacy(Aggregation::RoughAvg),
             "bit-or" => Self::Legacy(Aggregation::BitOr),
-            "mean" => Self::Mean,
+            "mean" | "avg" => Self::Mean,
             _ => {
                 let invalid = || {
                     format!(
@@ -172,6 +172,192 @@ impl BlockSamples {
             Reducer::Legacy(_) => unreachable!("legacy aggregations are reduced elsewhere"),
         })
     }
+}
+
+/// Fractional statistics for raster encoding and classification. The integer
+/// form remains available for MVT attributes and its exact half-even rounding.
+impl BlockSamples {
+    pub(crate) fn reduce_fractional(
+        &mut self,
+        reducer: Reducer,
+        capacity: u64,
+        fill: Option<i32>,
+    ) -> Option<f64> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        assert!(self.stored_weight <= capacity, "source cells overlap");
+        if reducer == Reducer::Mean {
+            let missing = if fill.is_some() {
+                capacity - self.stored_weight
+            } else {
+                0
+            };
+            let sum = self
+                .samples
+                .iter()
+                .map(|&(v, w)| i128::from(v) * i128::from(w))
+                .sum::<i128>()
+                + i128::from(fill.unwrap_or(0)) * i128::from(missing);
+            return Some(sum as f64 / (self.stored_weight + missing) as f64);
+        }
+        self.reduce(reducer, capacity, fill).map(f64::from)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Entry {
+    value: i32,
+    next: u32,
+    weight: u64,
+}
+const END: u32 = u32::MAX;
+
+/// One arena for all live raster pixels; there is no allocation per pixel.
+/// Mean/extrema keep fixed-size state, and only percentiles retain samples.
+#[derive(Default)]
+pub(super) struct Workspace {
+    entries: Vec<Entry>,
+    scratch: BlockSamples,
+}
+
+thread_local! { static WORKSPACE:std::cell::RefCell<Workspace> = std::cell::RefCell::new(Workspace::default()); }
+
+pub(super) fn with_workspace<T>(f: impl FnOnce(&mut Workspace) -> T) -> T {
+    let mut work = WORKSPACE.with(|slot| slot.take());
+    work.entries.clear();
+    work.scratch.clear();
+    let result = f(&mut work);
+    WORKSPACE.with(|slot| *slot.borrow_mut() = work);
+    result
+}
+
+#[derive(Clone)]
+pub(super) struct Accumulator {
+    weight: u64,
+    sum: i128,
+    min: i32,
+    max: i32,
+    bits: i32,
+    head: u32,
+}
+impl Default for Accumulator {
+    fn default() -> Self {
+        Self {
+            weight: 0,
+            sum: 0,
+            min: i32::MAX,
+            max: i32::MIN,
+            bits: 0,
+            head: END,
+        }
+    }
+}
+impl Accumulator {
+    pub(super) fn add(&mut self, value: i32, weight: u64, reducer: Reducer, work: &mut Workspace) {
+        if weight == 0 {
+            return;
+        }
+        self.weight = self
+            .weight
+            .checked_add(weight)
+            .expect("grid weight fits u64");
+        match reducer {
+            Reducer::Mean | Reducer::Legacy(Aggregation::RoughAvg) => {
+                self.sum += i128::from(value) * i128::from(weight)
+            }
+            Reducer::Legacy(Aggregation::Max) => self.max = self.max.max(value),
+            Reducer::Legacy(Aggregation::Min) => self.min = self.min.min(value),
+            Reducer::Legacy(Aggregation::BitOr) => self.bits |= value,
+            Reducer::Percentile(_) => {
+                self.min = self.min.min(value);
+                self.max = self.max.max(value);
+                let next = u32::try_from(work.entries.len()).expect("too many percentile samples");
+                assert_ne!(next, END);
+                work.entries.push(Entry {
+                    value,
+                    weight,
+                    next: self.head,
+                });
+                self.head = next;
+            }
+        }
+    }
+    pub(super) fn finish(
+        &self,
+        reducer: Reducer,
+        capacity: u64,
+        fill: Option<i32>,
+        work: &mut Workspace,
+    ) -> Option<f64> {
+        if self.weight == 0 {
+            return None;
+        }
+        assert!(
+            self.weight <= capacity,
+            "source cells overlap or exceed pixel capacity"
+        );
+        let missing = if fill.is_some() {
+            capacity - self.weight
+        } else {
+            0
+        };
+        let fill = fill.filter(|_| missing > 0);
+        let total = self.weight + missing;
+        Some(match reducer {
+            Reducer::Mean | Reducer::Legacy(Aggregation::RoughAvg) => {
+                (self.sum + i128::from(fill.unwrap_or(0)) * i128::from(missing)) as f64
+                    / total as f64
+            }
+            Reducer::Legacy(Aggregation::Max) => {
+                f64::from(fill.map_or(self.max, |v| self.max.max(v)))
+            }
+            Reducer::Legacy(Aggregation::Min) => {
+                f64::from(fill.map_or(self.min, |v| self.min.min(v)))
+            }
+            Reducer::Legacy(Aggregation::BitOr) => f64::from(self.bits | fill.unwrap_or(0)),
+            Reducer::Percentile(fraction) => {
+                let rank = ((u128::from(fraction.numerator) * u128::from(total))
+                    .div_ceil(u128::from(fraction.denominator)) as u64)
+                    .max(1);
+                if rank == 1 {
+                    return Some(f64::from(fill.map_or(self.min, |v| self.min.min(v))));
+                }
+                if rank == total {
+                    return Some(f64::from(fill.map_or(self.max, |v| self.max.max(v))));
+                }
+                if let Some(fill) = fill
+                    && fill <= self.min
+                    && rank <= missing
+                {
+                    return Some(f64::from(fill));
+                }
+                work.scratch.clear();
+                let mut head = self.head;
+                while head != END {
+                    let entry = work.entries[head as usize];
+                    work.scratch.push(entry.value, entry.weight);
+                    head = entry.next;
+                }
+                return work.scratch.reduce_fractional(reducer, capacity, fill);
+            }
+        })
+    }
+}
+
+pub(super) fn effective_reducer(reducer: Reducer, capacity: u64) -> Reducer {
+    if let Reducer::Percentile(f) = reducer {
+        if f.numerator == 0 {
+            return Reducer::Legacy(Aggregation::Min);
+        }
+        if capacity > 0
+            && (u128::from(f.numerator) * u128::from(capacity)).div_ceil(u128::from(f.denominator))
+                == u128::from(capacity)
+        {
+            return Reducer::Legacy(Aggregation::Max);
+        }
+    }
+    reducer
 }
 
 /// The weighted mean of the samples, rounded half to even.
@@ -401,5 +587,66 @@ mod tests {
         assert!("p-1".parse::<Reducer>().is_err());
         assert!("median".parse::<Reducer>().is_err());
         assert_eq!("p99.5".parse::<Reducer>().unwrap().name(), "p99.5");
+    }
+    #[test]
+    fn weighted_selection_matches_an_independent_sort_oracle() {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..6000 {
+            let size = 1 + (random() % 160) as usize;
+            let samples: Vec<_> = (0..size)
+                .map(|_| {
+                    let value = match case % 4 {
+                        0 => (random() % 5) as i32 - 2,
+                        1 => random() as i32,
+                        2 => 7,
+                        _ => (random() % 2000) as i32 - 1000,
+                    };
+                    (value.max(i32::MIN + 1), 1u64 << (2 * (random() % 17)))
+                })
+                .collect();
+            let real: u64 = samples.iter().map(|v| v.1).sum();
+            let fill_value = (random() % 3000) as i32 - 1500;
+            let missing = random() % (1u64 << 40);
+            for p in [0, 1, 5, 50, 90, 95, 99, 100] {
+                for fill in [None, Some(fill_value)] {
+                    let method = Reducer::Percentile(Fraction {
+                        numerator: p,
+                        denominator: 100,
+                    });
+                    let mut work = Workspace::default();
+                    let mut state = Accumulator::default();
+                    for &(value, weight) in &samples {
+                        state.add(value, weight, method, &mut work);
+                    }
+                    let mut oracle = samples.clone();
+                    if let Some(fill) = fill {
+                        oracle.push((fill, missing));
+                    }
+                    oracle.sort_unstable_by_key(|v| v.0);
+                    let total = real + if fill.is_some() { missing } else { 0 };
+                    let target = (u128::from(total) * u128::from(p)).div_ceil(100).max(1);
+                    let mut cumulative = 0u128;
+                    let expected = oracle
+                        .iter()
+                        .find(|v| {
+                            cumulative += u128::from(v.1);
+                            cumulative >= target
+                        })
+                        .unwrap()
+                        .0;
+                    assert_eq!(
+                        state.finish(method, real + missing, fill, &mut work),
+                        Some(f64::from(expected)),
+                        "case={case}, p={p}, fill={fill:?}"
+                    );
+                }
+            }
+        }
     }
 }

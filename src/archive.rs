@@ -46,6 +46,8 @@ pub struct ConvertOptions {
     /// Physical value counted over the part of a block no cell is stored for,
     /// as `[<band>=]<value>`. Needs a weighted `aggregation`.
     pub fill: Vec<String>,
+    /// Missing-cell policy for weighted statistics: exclude or a physical fill value.
+    pub missing: Option<String>,
     /// MVT tile extent. Defaults to 4096.
     pub extent: Option<u32>,
     /// MVT geometry kept beyond each tile edge, in 1/256ths of the tile width.
@@ -81,6 +83,7 @@ impl Default for ConvertOptions {
             omit_zero: false,
             aggregation: None,
             fill: Vec::new(),
+            missing: None,
             extent: None,
             buffer: None,
             detail: None,
@@ -123,7 +126,7 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
         options.skip_analysis,
         options.min_lead_time,
     )?;
-    let mut products = prepare::prepare_products(products);
+    let mut products = prepare::prepare_products(products)?;
     let layer_names = build_layer_names(options, products.len())?;
 
     ensure_compatible_products(&products)?;
@@ -134,7 +137,12 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
         &options.omit_class,
         options.omit_zero,
     )?;
-    apply_aggregation(&mut products, options.aggregation.as_deref(), &options.fill)?;
+    apply_aggregation(
+        &mut products,
+        options.aggregation.as_deref(),
+        &options.fill,
+        options.missing.as_deref(),
+    )?;
     let output_format = output_format(&products, options)?;
     // A smaller raster tile needs one more zoom to reach the same pixels.
     let zoom_offset = match output_format {
@@ -682,7 +690,35 @@ fn validate_options(options: &ConvertOptions) -> Result<()> {
         "--fill counts the area no cell covers, which only --aggregation mean or p<percent> weigh"
     );
     quantize::validate_fill_syntax(&options.fill)?;
+    if let Some(missing) = &options.missing {
+        ensure!(
+            reducer.is_some_and(Reducer::is_weighted),
+            "--missing requires --aggregation mean or p<percent>"
+        );
+        if missing != "exclude" {
+            quantize::validate_fill_syntax(std::slice::from_ref(missing))?;
+        }
+    }
     Ok(())
+}
+
+fn default_zero_fill(kind: gpv_products::products::GpvProductElement) -> bool {
+    use gpv_products::products::GpvProductElement::*;
+    matches!(
+        kind,
+        BunpuPrecipitation
+            | BunpuSnowfall
+            | HiresNowcastIntensity
+            | HiresNowcastPrecip
+            | Precipitaiton
+            | Precipitaiton15h
+            | SnowDepth
+            | Snowfall
+            | GsmPrecipitation
+            | LfmPrecipitation
+            | MsmPrecipitation
+            | MepsPrecipitation
+    )
 }
 
 /// What the tiles are written as: raster images when `--raster` is given,
@@ -726,6 +762,7 @@ fn apply_aggregation(
     products: &mut [PreparedProduct],
     aggregation: Option<&str>,
     fill: &[String],
+    missing: Option<&str>,
 ) -> Result<()> {
     let Some(aggregation) = aggregation else {
         return Ok(());
@@ -733,7 +770,42 @@ fn apply_aggregation(
     let reducer = aggregation.parse::<Reducer>()?;
     for (index, product) in products.iter_mut().enumerate() {
         product.spec.reducer = reducer;
-        product.spec.fill = quantize::resolve_fill(fill, &product.spec.band_specs)?;
+        if matches!(reducer, Reducer::Percentile(_)) {
+            use gpv_products::products::GpvProductElement::*;
+            ensure!(
+                product.spec.band_specs.len() == 1
+                    && !matches!(
+                        product.product_id.kind,
+                        BunpuWeather | SuikeiWeather | HiresCloudType | HiresCloudQc
+                    ),
+                "percentiles require an ordered scalar, not vector components or nominal codes"
+            );
+        }
+        let default = missing
+            .map(str::to_owned)
+            .or_else(|| default_zero_fill(product.product_id.kind).then(|| "0".into()));
+        product.spec.fill = if reducer.is_weighted() {
+            match default.as_deref() {
+                None | Some("exclude") => vec![None; product.spec.band_specs.len()],
+                Some(value) => quantize::resolve_fill(
+                    &product
+                        .spec
+                        .band_specs
+                        .iter()
+                        .map(|b| format!("{}={value}", b.name))
+                        .collect::<Vec<_>>(),
+                    &product.spec.band_specs,
+                )?,
+            }
+        } else {
+            vec![None; product.spec.band_specs.len()]
+        };
+        let overrides = quantize::resolve_fill(fill, &product.spec.band_specs)?;
+        for (target, value) in product.spec.fill.iter_mut().zip(overrides) {
+            if value.is_some() {
+                *target = value;
+            }
+        }
         if index == 0 {
             info!(aggregation = %reducer.name(), "combining cells");
         }
@@ -1596,6 +1668,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn weighted_missing_defaults_and_physical_overrides() {
+        use gpv_products::{model::BandSpec, products::GpvProductElement};
+        let mut products = [product(0, GeneratingProcessType::Forecast)];
+        products[0].spec.band_specs = vec![BandSpec {
+            name: "value".into(),
+            reference_value: -10.0,
+            binary_scale: -1,
+            ..Default::default()
+        }];
+        apply_aggregation(&mut products, Some("p95"), &[], None).unwrap();
+        assert_eq!(products[0].spec.fill, vec![Some(20)]);
+        apply_aggregation(&mut products, Some("mean"), &[], Some("exclude")).unwrap();
+        assert_eq!(products[0].spec.fill, vec![None]);
+        apply_aggregation(&mut products, Some("avg"), &["value=2".into()], Some("0")).unwrap();
+        assert_eq!(products[0].spec.fill, vec![Some(24)]);
+        assert!(apply_aggregation(&mut products, Some("mean"), &[], Some("0.1")).is_err());
+        for kind in [
+            GpvProductElement::NowcastEchoTops,
+            GpvProductElement::CwmWave,
+        ] {
+            products[0].product_id.kind = kind;
+            apply_aggregation(&mut products, Some("mean"), &[], None).unwrap();
+            assert_eq!(products[0].spec.fill, vec![None]);
+        }
+        products[0].product_id.kind = GpvProductElement::BunpuWeather;
+        assert!(apply_aggregation(&mut products, Some("p95"), &[], None).is_err());
+        products[0].product_id.kind = GpvProductElement::GsmWind;
+        products[0].spec.band_specs.push(BandSpec {
+            name: "v".into(),
+            ..Default::default()
+        });
+        assert!(apply_aggregation(&mut products, Some("p95"), &[], None).is_err());
+    }
+
+    #[test]
+    fn missing_policy_requires_weighted_statistics() {
+        for method in [None, Some("max"), Some("rough-avg")] {
+            assert!(
+                validate_options(&ConvertOptions {
+                    aggregation: method.map(str::to_owned),
+                    missing: Some("0".into()),
+                    ..Default::default()
+                })
+                .is_err()
+            );
+        }
+        for policy in ["exclude", "0", "-5"] {
+            assert!(
+                validate_options(&ConvertOptions {
+                    aggregation: Some("mean".into()),
+                    missing: Some(policy.into()),
+                    ..Default::default()
+                })
+                .is_ok()
+            );
+        }
+    }
+
     fn offsets(products: &[PreparedProduct]) -> Vec<i64> {
         products
             .iter()
@@ -1644,7 +1775,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let prepared = prepare::prepare_products(selected);
+        let prepared = prepare::prepare_products(selected).unwrap();
 
         assert_eq!(prepared.len(), 1);
         assert_eq!(

@@ -63,6 +63,43 @@ fn level_descriptor(product: &PreparedProduct) -> Value {
     }
 }
 
+fn aggregation_descriptor(product: &PreparedProduct, raster: bool) -> Value {
+    let spec = &product.spec;
+    let fill = spec
+        .band_specs
+        .iter()
+        .zip(&spec.fill)
+        .filter_map(|(band, value)| {
+            let raw = f64::from((*value)?);
+            let physical = (f64::from(band.reference_value)
+                + raw * 2f64.powi(i32::from(band.binary_scale)))
+                * 10f64.powi(-i32::from(band.decimal_scale));
+            Some((band.name.clone(), json!(physical)))
+        })
+        .collect::<Map<String, Value>>();
+    let method = if raster
+        && matches!(
+            spec.reducer,
+            Reducer::Legacy(gpv_products::model::Aggregation::RoughAvg)
+        ) {
+        "mean".into()
+    } else {
+        spec.reducer.name()
+    };
+    json!({
+        "method": method,
+        "fill": fill,
+        "missing_default": "exclude-unless-filled",
+        "weighting": if raster || spec.reducer.is_weighted() {
+            "basic-grid-cell-count"
+        } else {
+            "native-cell-count"
+        },
+        "empty_block": "missing",
+        "quantization": "after-aggregation",
+    })
+}
+
 /// Everything a client needs to decode a raster tile, save what differs
 /// between forecast times.
 ///
@@ -90,6 +127,15 @@ pub(crate) fn raster_encoding(product: Option<&PreparedProduct>, layout: RasterL
     object.insert("image_size".into(), json!(layout.image_size()));
 
     if let Some(product) = product {
+        object.insert("aggregation".into(), aggregation_descriptor(product, true));
+        object.insert("resampling".into(),json!({
+            "downsampling":"basic-cell-centre-aggregation",
+            "weighting":"basic-grid-cell-count",
+            "ground_area_weighted":false,
+            "downsampling_condition":"both-native-axes-finer-than-pixel-throughout-product",
+            "upsampling":if product.spec.quantize.iter().any(Option::is_some) {"nearest"} else {"bilinear"},
+            "source_interpretation_at_low_zoom":"constant-per-native-cell",
+        }));
         object.insert(
             "bands".into(),
             json!(
@@ -234,22 +280,8 @@ pub(crate) fn generate_metadata(
     // Recorded only when chosen, so that a run that does not choose writes
     // the same metadata as before.
     let aggregation = products.first().and_then(|product| {
-        let spec = &product.spec;
-        (spec.reducer != Reducer::Legacy(product.product_id.aggregation())).then(|| {
-            let fill = spec
-                .band_specs
-                .iter()
-                .zip(&spec.fill)
-                .filter_map(|(band, fill)| {
-                    let raw = f64::from((*fill)?);
-                    let physical = (f64::from(band.reference_value)
-                        + raw * 2f64.powi(i32::from(band.binary_scale)))
-                        * 10f64.powi(-i32::from(band.decimal_scale));
-                    Some((band.name.clone(), json!(physical)))
-                })
-                .collect::<Map<String, Value>>();
-            json!({ "method": spec.reducer.name(), "fill": fill })
-        })
+        (product.spec.reducer != Reducer::Legacy(product.product_id.aggregation()))
+            .then(|| aggregation_descriptor(product, matches!(output, TileOutput::Raster(_))))
     });
 
     let mut metadata = Map::new();
