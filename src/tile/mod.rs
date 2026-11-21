@@ -613,6 +613,9 @@ pub(crate) struct MvtLayout {
     pub(crate) buffer: u32,
     /// How coarsely cells are merged at each zoom; see [`detail`].
     pub(crate) detail: DetailSchedule,
+    /// Merge the low zooms into a lattice of `2^detail` pixels across each
+    /// tile, at an extent of the same size, instead of into blocks of cells.
+    pub(crate) lattice: bool,
 }
 
 impl Default for MvtLayout {
@@ -621,6 +624,7 @@ impl Default for MvtLayout {
             extent: 4096,
             buffer: 2,
             detail: DetailSchedule::default(),
+            lattice: false,
         }
     }
 }
@@ -709,6 +713,24 @@ pub(crate) fn make_layer(
         ),
         TileOutput::Raster(_) => 0,
     };
+    // The lattice replaces the blocks, so it takes the zooms that merge cells
+    // and leaves the cells themselves to the zooms that do not.
+    if let TileOutput::Mvt(layout) = output
+        && layout.lattice
+        && aggregation_scale > 0
+    {
+        return reduce::with_workspace(|work| {
+            mvt::render_lattice_layer(
+                layer_name,
+                product,
+                tile_context.zxy,
+                &chunks,
+                layout,
+                &band_scales(product),
+                work,
+            )
+        });
+    }
     let aggregation_width = 1u32 << aggregation_scale;
     let aggregation_mask = !(aggregation_width - 1);
     let grid = &product.spec.grid_spec;
@@ -1299,6 +1321,86 @@ mod tests {
             );
         }
         assert!(columns_on_grid > 100);
+    }
+
+    /// A lattice layer is one unit square per pixel with a value, merged:
+    /// its polygons cover exactly as many units as pixels hold a value.
+    #[test]
+    fn a_lattice_layer_covers_one_unit_per_pixel_with_a_value() {
+        let mut product = mixed_product();
+        product.spec.reducer = "p95".parse().unwrap();
+        product.spec.fill = vec![Some(0)];
+        let layout = MvtLayout {
+            lattice: true,
+            ..Default::default()
+        };
+        let (lng, lat): (f64, f64) = (118.0 + 3300.0 / 320.0, 20.0 + 2300.0 / 480.0);
+        for z in [4u8, 6, 7] {
+            let n = f64::from(1u32 << z);
+            let zxy = (
+                z,
+                ((lng + 180.0) / 360.0 * n) as u32,
+                ((1.0
+                    - (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln()
+                        / std::f64::consts::PI)
+                    / 2.0
+                    * n) as u32,
+            );
+            let bytes = make_layer(
+                &TileContext::new(zxy),
+                &product,
+                "layer",
+                TileOutput::Mvt(layout),
+            )
+            .unwrap()
+            .unwrap();
+            let reader = fast_mvt::MvtReaderRef::new(&bytes).unwrap();
+            let layer = reader.layers().next().unwrap();
+            assert_eq!(layer.extent(), 256, "z{z}");
+            let ring_area = |ring: &fast_mvt::MvtLineString| {
+                ring.0
+                    .windows(2)
+                    .map(|pair| {
+                        i64::from(pair[0].x) * i64::from(pair[1].y)
+                            - i64::from(pair[1].x) * i64::from(pair[0].y)
+                    })
+                    .sum::<i64>()
+                    .abs()
+                    / 2
+            };
+            let mut area = 0;
+            for feature in layer.features() {
+                let polygons = match feature.geometry().unwrap() {
+                    fast_mvt::MvtGeometry::MultiPolygon(polygons) => polygons.0,
+                    fast_mvt::MvtGeometry::Polygon(polygon) => vec![polygon],
+                    other => panic!("a lattice feature is a polygon, not {other:?}"),
+                };
+                for polygon in polygons {
+                    area += ring_area(polygon.exterior());
+                    area -= polygon.interiors().iter().map(ring_area).sum::<i64>();
+                }
+            }
+
+            let chunks = source_chunks(&product, zxy, TileOutput::Mvt(layout));
+            let pixels = reduce::with_workspace(|work| {
+                raster::aggregate_pixels(
+                    &product,
+                    zxy,
+                    &chunks,
+                    raster::PixelLattice {
+                        across: 256,
+                        margin: 0,
+                        bands: 1,
+                        every_band: false,
+                        output: TileOutput::Mvt(layout),
+                    },
+                    work,
+                )
+                .map_or(0, |_| work.touched.len())
+            });
+            assert!(pixels > 0, "z{z}");
+            assert_eq!(area, pixels as i64, "z{z}");
+        }
     }
 
     fn value(value: i32) -> CompactOptI32 {

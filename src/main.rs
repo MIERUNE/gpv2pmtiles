@@ -66,6 +66,13 @@ struct Cli {
     #[arg(long, value_name = "SPEC")]
     detail: Option<String>,
 
+    /// Experimental: merge the low zooms into a lattice of 2^detail pixels
+    /// across each tile, as --raster does, and write them at an extent of the
+    /// same size, one unit per pixel. Zooms whose cells are coarser than the
+    /// lattice keep the cells of the grid at --extent.
+    #[arg(long)]
+    lattice: bool,
+
     /// Drop products that are analyses rather than forecasts. Nowcast inputs
     /// lead with the observed field, valid at the reference time itself, which
     /// otherwise becomes the first layer.
@@ -206,6 +213,7 @@ fn main() -> Result<()> {
             extent: cli.extent,
             buffer: cli.buffer,
             detail: cli.detail,
+            lattice: cli.lattice,
             raster: cli.raster,
             raster_size: cli.raster_size,
             manifest: cli.manifest,

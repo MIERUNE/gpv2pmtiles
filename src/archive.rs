@@ -56,6 +56,9 @@ pub struct ConvertOptions {
     /// How coarsely cells are merged at each zoom, as `<detail>` or
     /// `<zoom>:<detail>,...`. Defaults to 8 at every zoom.
     pub detail: Option<String>,
+    /// Merge the low zooms of MVT output into a lattice of `2^detail` pixels
+    /// across each tile, at an extent of the same size. Experimental.
+    pub lattice: bool,
     /// Emit RGBA raster tiles with this colour encoding instead of MVT.
     pub raster: Option<String>,
     /// Pixels across a raster tile, 256 or 512. Defaults to 512.
@@ -87,6 +90,7 @@ impl Default for ConvertOptions {
             extent: None,
             buffer: None,
             detail: None,
+            lattice: false,
             raster: None,
             raster_size: None,
             manifest: None,
@@ -638,6 +642,9 @@ fn normalize_empty_leaf_offset(file: &mut (impl Read + Write + Seek)) -> Result<
 const MAX_MVT_EXTENT: u32 = 1 << 16;
 const MAX_MVT_BUFFER: u32 = 256;
 
+/// The finest lattice `--lattice` writes: one unit of a 4096 extent per pixel.
+const MAX_LATTICE_DETAIL: u8 = 12;
+
 fn validate_options(options: &ConvertOptions) -> Result<()> {
     ensure!(
         !options.layer_name_pattern.is_empty(),
@@ -680,6 +687,19 @@ fn validate_options(options: &ConvertOptions) -> Result<()> {
         ensure!(
             RASTER_TILE_SIZES.contains(&size),
             "--raster-size must be one of {RASTER_TILE_SIZES:?}"
+        );
+    }
+    ensure!(
+        !options.lattice || options.raster.is_none(),
+        "--lattice applies to MVT output; --raster already aggregates into its pixels"
+    );
+    if options.lattice
+        && let Some(spec) = &options.detail
+    {
+        let schedule = spec.parse::<DetailSchedule>()?;
+        ensure!(
+            (0..=31).all(|zoom| schedule.at(zoom) <= MAX_LATTICE_DETAIL),
+            "--lattice takes --detail up to {MAX_LATTICE_DETAIL}, an extent of 4096"
         );
     }
     ensure!(
@@ -760,6 +780,7 @@ fn output_format(products: &[PreparedProduct], options: &ConvertOptions) -> Resu
                     Some(spec) => spec.parse::<DetailSchedule>()?,
                     None => default.detail,
                 },
+                lattice: options.lattice,
             })
         }
     })

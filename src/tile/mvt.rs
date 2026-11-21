@@ -26,6 +26,130 @@ pub(super) fn render_mvt_layer(
         tile_bounds,
         layout,
     );
+    encode_layer(
+        layer_name,
+        tileset_spec,
+        layout.extent,
+        grouped_rectangles,
+        band_scales,
+    )
+}
+
+/// Renders a layer from a lattice of `2^detail` pixels across the tile, each
+/// one unit of an extent of the same size.
+///
+/// The pixels are gathered as a raster tile's are, so the blocks line up with
+/// the tile instead of the source grid: none straddles an edge, and none is so
+/// small that rounding to the extent loses it. A pixel's polygon is its unit
+/// square, so the layer needs no margin beyond the tile.
+pub(super) fn render_lattice_layer(
+    layer_name: &str,
+    product: &crate::model::PreparedProduct,
+    zxy: super::Zxy,
+    chunks: &[&[(u64, crate::model::BaseTile)]],
+    layout: MvtLayout,
+    band_scales: &Vec<BandScale<'_>>,
+    work: &mut super::reduce::Workspace,
+) -> Result<Option<Vec<u8>>> {
+    let spec = &product.spec;
+    let bands = spec.band_specs.len();
+    let across = 1u32 << layout.detail.at(zxy.0);
+    let Some(size) = super::raster::aggregate_pixels(
+        product,
+        zxy,
+        chunks,
+        super::raster::PixelLattice {
+            across,
+            margin: 0,
+            bands,
+            every_band: false,
+            output: super::TileOutput::Mvt(layout),
+        },
+        work,
+    ) else {
+        return Ok(None);
+    };
+    let super::reduce::Workspace {
+        entries,
+        scratch,
+        pixels,
+        methods,
+        capacities,
+        touched,
+    } = work;
+
+    let mut cells = touched
+        .iter()
+        .filter_map(|&index| {
+            let index = index as usize;
+            let mut values = [CompactOptI32::NONE; 4];
+            for (b, value) in values.iter_mut().enumerate().take(bands) {
+                *value = CompactOptI32::new(
+                    pixels[index * bands + b]
+                        .finish(
+                            methods[index],
+                            capacities[index],
+                            spec.fill[b],
+                            entries,
+                            scratch,
+                        )
+                        .and_then(|raw| crate::quantize::postprocess(raw, b, spec))
+                        .map(|raw| raw.round_ties_even() as i32),
+                );
+            }
+            values
+                .iter()
+                .any(|value| value.get().is_some())
+                .then_some((index, values))
+        })
+        .collect::<Vec<_>>();
+    cells.sort_unstable_by_key(|&(index, _)| index);
+
+    // Runs of equal values along a row become one rectangle, which leaves the
+    // union a fraction of the edges to merge.
+    let mut grouped_rectangles: HashMap<[CompactOptI32; 4], Vec<IntRect>> = HashMap::default();
+    let mut run: Option<(usize, usize, usize, [CompactOptI32; 4])> = None;
+    let mut flush = |run: Option<(usize, usize, usize, [CompactOptI32; 4])>| {
+        if let Some((row, first, end, values)) = run {
+            grouped_rectangles
+                .entry(values)
+                .or_default()
+                .push(IntRect::new(
+                    first as i32,
+                    row as i32,
+                    end as i32,
+                    row as i32 + 1,
+                ));
+        }
+    };
+    for (index, values) in cells {
+        let (row, column) = (index / size, index % size);
+        run = match run {
+            Some((run_row, first, end, run_values))
+                if run_row == row && end == column && run_values == values =>
+            {
+                Some((row, first, column + 1, values))
+            }
+            other => {
+                flush(other);
+                Some((row, column, column + 1, values))
+            }
+        };
+    }
+    flush(run);
+
+    encode_layer(layer_name, spec, across, grouped_rectangles, band_scales)
+}
+
+/// Merges each group of rectangles into polygons and writes them as the
+/// features of one layer.
+fn encode_layer(
+    layer_name: &str,
+    tileset_spec: &TilesetSpec,
+    extent: u32,
+    grouped_rectangles: HashMap<[CompactOptI32; 4], Vec<IntRect>>,
+    band_scales: &Vec<BandScale<'_>>,
+) -> Result<Option<Vec<u8>>> {
     if grouped_rectangles.is_empty() {
         return Ok(None);
     }
@@ -51,7 +175,7 @@ pub(super) fn render_mvt_layer(
 
     // Encode features
     let mut layer = MvtLayerBuilder::new(layer_name)?;
-    layer.extent(std::num::NonZeroU32::new(layout.extent).expect("MVT extent is positive"));
+    layer.extent(std::num::NonZeroU32::new(extent).expect("MVT extent is positive"));
     for (values, geometry) in value_geom {
         let mut feature = layer.feature(&geometry)?;
         for (band, raw_value) in band_scales.iter().zip(values) {
