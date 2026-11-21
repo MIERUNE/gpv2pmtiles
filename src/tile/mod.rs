@@ -1,9 +1,11 @@
 mod detail;
 mod mvt;
+mod pyramid;
 mod raster;
 mod reduce;
 
 pub(crate) use detail::DetailSchedule;
+pub(crate) use pyramid::Pyramid;
 pub(crate) use reduce::Reducer;
 
 pub(crate) use raster::{
@@ -633,6 +635,35 @@ impl Default for MvtLayout {
 /// [`MvtLayout::buffer`].
 const CONTEXT_BUFFER: u32 = 2;
 
+/// The level `zoom + detail` a zoom aggregates its pixels at, or `None` for a
+/// zoom that draws blocks or cells instead.
+///
+/// MVT takes the lattice, when asked to, at the zooms that would otherwise
+/// merge cells into blocks; a raster tile wherever a cell is finer than a
+/// pixel. A level is the number of pixels across the world as a power of two,
+/// so zooms whose details differ can share one.
+pub(crate) fn lattice_level(product: &PreparedProduct, zoom: u8, output: TileOutput) -> Option<u8> {
+    let grid = &product.spec.grid_spec;
+    match output {
+        TileOutput::Mvt(layout) => {
+            let maximum_detail_zoom = (grid.lat_denom * 360.0 * 2.0 / 512.0).log2().round() as u8;
+            let detail = layout.detail.at(zoom);
+            let scale = detail::mvt_aggregation_scale(
+                maximum_detail_zoom,
+                zoom,
+                detail,
+                (grid.lng_denom, grid.lat_denom),
+                layout.extent,
+            );
+            (layout.lattice && scale > 0).then_some(zoom + detail)
+        }
+        TileOutput::Raster(layout) => {
+            raster::uses_pixel_aggregation(&product.spec, (zoom, 0, 0), layout.size)
+                .then_some(zoom + layout.size.trailing_zeros() as u8)
+        }
+    }
+}
+
 pub(crate) fn make_layer(
     tile_context: &TileContext,
     product: &PreparedProduct,
@@ -645,18 +676,27 @@ pub(crate) fn make_layer(
         return Ok(None);
     }
     let chunks = source_chunks(product, tile_context.zxy, output);
-    if let TileOutput::Raster(encoding) = output
-        && raster::uses_pixel_aggregation(&product.spec, tile_context.zxy, encoding.size)
-    {
-        return reduce::with_workspace(|work| {
-            raster::render_pixel_tile(
+    if let Some(level) = lattice_level(product, z, output) {
+        return reduce::with_workspace(|work| match output {
+            TileOutput::Mvt(layout) => mvt::render_lattice_layer(
+                layer_name,
+                product,
+                tile_context.zxy,
+                &chunks,
+                layout,
+                level,
+                &band_scales(product),
+                work,
+            ),
+            TileOutput::Raster(layout) => raster::render_pixel_tile(
                 product,
                 tile_context.zxy,
                 &chunks,
                 &band_scales(product),
-                encoding,
+                layout,
+                level,
                 work,
-            )
+            ),
         });
     }
 
@@ -713,24 +753,6 @@ pub(crate) fn make_layer(
         ),
         TileOutput::Raster(_) => 0,
     };
-    // The lattice replaces the blocks, so it takes the zooms that merge cells
-    // and leaves the cells themselves to the zooms that do not.
-    if let TileOutput::Mvt(layout) = output
-        && layout.lattice
-        && aggregation_scale > 0
-    {
-        return reduce::with_workspace(|work| {
-            mvt::render_lattice_layer(
-                layer_name,
-                product,
-                tile_context.zxy,
-                &chunks,
-                layout,
-                &band_scales(product),
-                work,
-            )
-        });
-    }
     let aggregation_width = 1u32 << aggregation_scale;
     let aggregation_mask = !(aggregation_width - 1);
     let grid = &product.spec.grid_spec;
@@ -1323,8 +1345,9 @@ mod tests {
         assert!(columns_on_grid > 100);
     }
 
-    /// A lattice layer is one unit square per pixel with a value, merged:
-    /// its polygons cover exactly as many units as pixels hold a value.
+    /// A lattice layer is one unit square per pixel with a value, margin
+    /// included, merged: its polygons cover exactly as many units as pixels
+    /// hold a value.
     #[test]
     fn a_lattice_layer_covers_one_unit_per_pixel_with_a_value() {
         let mut product = mixed_product();
@@ -1389,7 +1412,7 @@ mod tests {
                     &chunks,
                     raster::PixelLattice {
                         across: 256,
-                        margin: 0,
+                        margin: layout.buffer,
                         bands: 1,
                         every_band: false,
                         output: TileOutput::Mvt(layout),
@@ -1401,6 +1424,62 @@ mod tests {
             assert!(pixels > 0, "z{z}");
             assert_eq!(area, pixels as i64, "z{z}");
         }
+    }
+
+    /// The pyramid stands in for gathering the cells, so every tile has to
+    /// come out the same byte for byte with it as without it.
+    ///
+    /// A vector tile gathers only the chunks under it, so its margin comes out
+    /// whole only from the pyramid; it is compared without one. A raster tile
+    /// reads its neighbours, and is compared margin and all.
+    #[test]
+    fn the_pyramid_draws_the_tiles_the_cells_do() {
+        let mut product = mixed_product();
+        product.spec.reducer = "max".parse().unwrap();
+        let (lng, lat): (f64, f64) = (118.0 + 3300.0 / 320.0, 20.0 + 2300.0 / 480.0);
+        let outputs = [
+            TileOutput::Mvt(MvtLayout {
+                lattice: true,
+                buffer: 0,
+                ..Default::default()
+            }),
+            TileOutput::Raster(RasterLayout::new(ColorEncoding::Scalar16 {
+                min: -20.0,
+                max: 60.0,
+            })),
+            TileOutput::Raster(RasterLayout {
+                encoding: ColorEncoding::Scalar16 {
+                    min: -20.0,
+                    max: 60.0,
+                },
+                size: 256,
+            }),
+        ];
+        let mut compared = 0;
+        for output in outputs {
+            product.pyramid = None;
+            crate::archive::build_pyramid(&mut product, 0, 10, output);
+            assert!(product.pyramid.is_some(), "{output:?}");
+            for z in 2u8..=9 {
+                let n = f64::from(1u32 << z);
+                let x = ((lng + 180.0) / 360.0 * n) as u32;
+                let y = ((1.0
+                    - (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln()
+                        / std::f64::consts::PI)
+                    / 2.0
+                    * n) as u32;
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let context = TileContext::new((z, x + dx, y + dy));
+                    let with = make_layer(&context, &product, "layer", output).unwrap();
+                    let pyramid = product.pyramid.take();
+                    let without = make_layer(&context, &product, "layer", output).unwrap();
+                    product.pyramid = pyramid;
+                    assert_eq!(with, without, "{output:?} z{z} +({dx},{dy})");
+                    compared += usize::from(with.is_some());
+                }
+            }
+        }
+        assert!(compared > 20);
     }
 
     fn value(value: i32) -> CompactOptI32 {

@@ -115,6 +115,9 @@ pub(crate) struct PreparedProduct {
     pub product_id: GpvProductIdentifier,
     pub spec: TilesetSpec,
     pub chunks: Vec<(u64, BaseTile)>,
+    /// Maxima over the pixel lattices the output aggregates at, when built;
+    /// see [`crate::tile::Pyramid`].
+    pub pyramid: Option<crate::tile::Pyramid>,
 }
 
 impl PreparedProduct {

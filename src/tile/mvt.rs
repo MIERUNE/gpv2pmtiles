@@ -40,73 +40,97 @@ pub(super) fn render_mvt_layer(
 ///
 /// The pixels are gathered as a raster tile's are, so the blocks line up with
 /// the tile instead of the source grid: none straddles an edge, and none is so
-/// small that rounding to the extent loses it. A pixel's polygon is its unit
-/// square, so the layer needs no margin beyond the tile.
+/// small that rounding to the extent loses it. The margin is whole pixels of
+/// the same lattice, so that an outline drawn along a polygon falls outside
+/// the tile rather than along its edge.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_lattice_layer(
     layer_name: &str,
     product: &crate::model::PreparedProduct,
     zxy: super::Zxy,
     chunks: &[&[(u64, crate::model::BaseTile)]],
     layout: MvtLayout,
+    level: u8,
     band_scales: &Vec<BandScale<'_>>,
     work: &mut super::reduce::Workspace,
 ) -> Result<Option<Vec<u8>>> {
     let spec = &product.spec;
     let bands = spec.band_specs.len();
     let across = 1u32 << layout.detail.at(zxy.0);
-    let Some(size) = super::raster::aggregate_pixels(
-        product,
-        zxy,
-        chunks,
-        super::raster::PixelLattice {
-            across,
-            margin: 0,
-            bands,
-            every_band: false,
-            output: super::TileOutput::Mvt(layout),
-        },
-        work,
-    ) else {
-        return Ok(None);
+    let margin = layout.buffer * across / 256;
+    let side = (across + 2 * margin) as usize;
+    let corner = (
+        i64::from(zxy.2) * i64::from(across) - i64::from(margin),
+        i64::from(zxy.1) * i64::from(across) - i64::from(margin),
+    );
+    let finished = |b: usize, raw: Option<f64>| {
+        CompactOptI32::new(
+            raw.and_then(|raw| crate::quantize::postprocess(raw, b, spec))
+                .map(|raw| raw.round_ties_even() as i32),
+        )
     };
-    let super::reduce::Workspace {
-        entries,
-        scratch,
-        pixels,
-        methods,
-        capacities,
-        touched,
-    } = work;
 
-    let mut cells = touched
-        .iter()
-        .filter_map(|&index| {
+    // (row, column, values) of the pixels with a value, row by row.
+    let mut cells = Vec::new();
+    if let Some(pyramid) = super::raster::nested_pyramid(product, level, corner, side) {
+        pyramid.window(level, corner, side, |row, column, raw| {
+            let mut values = [CompactOptI32::NONE; 4];
+            for (b, value) in values.iter_mut().enumerate().take(bands) {
+                *value = finished(b, raw[b].get().map(f64::from));
+            }
+            if values.iter().any(|value| value.get().is_some()) {
+                cells.push((row, column, values));
+            }
+        });
+    } else {
+        let Some(size) = super::raster::aggregate_pixels(
+            product,
+            zxy,
+            chunks,
+            super::raster::PixelLattice {
+                across,
+                margin,
+                bands,
+                every_band: false,
+                output: super::TileOutput::Mvt(layout),
+            },
+            work,
+        ) else {
+            return Ok(None);
+        };
+        let super::reduce::Workspace {
+            entries,
+            scratch,
+            pixels,
+            methods,
+            capacities,
+            touched,
+        } = work;
+        touched.sort_unstable();
+        for &index in touched.iter() {
             let index = index as usize;
             let mut values = [CompactOptI32::NONE; 4];
             for (b, value) in values.iter_mut().enumerate().take(bands) {
-                *value = CompactOptI32::new(
-                    pixels[index * bands + b]
-                        .finish(
-                            methods[index],
-                            capacities[index],
-                            spec.fill[b],
-                            entries,
-                            scratch,
-                        )
-                        .and_then(|raw| crate::quantize::postprocess(raw, b, spec))
-                        .map(|raw| raw.round_ties_even() as i32),
+                *value = finished(
+                    b,
+                    pixels[index * bands + b].finish(
+                        methods[index],
+                        capacities[index],
+                        spec.fill[b],
+                        entries,
+                        scratch,
+                    ),
                 );
             }
-            values
-                .iter()
-                .any(|value| value.get().is_some())
-                .then_some((index, values))
-        })
-        .collect::<Vec<_>>();
-    cells.sort_unstable_by_key(|&(index, _)| index);
+            if values.iter().any(|value| value.get().is_some()) {
+                cells.push((index / size, index % size, values));
+            }
+        }
+    }
 
     // Runs of equal values along a row become one rectangle, which leaves the
     // union a fraction of the edges to merge.
+    let margin = margin as i32;
     let mut grouped_rectangles: HashMap<[CompactOptI32; 4], Vec<IntRect>> = HashMap::default();
     let mut run: Option<(usize, usize, usize, [CompactOptI32; 4])> = None;
     let mut flush = |run: Option<(usize, usize, usize, [CompactOptI32; 4])>| {
@@ -115,15 +139,14 @@ pub(super) fn render_lattice_layer(
                 .entry(values)
                 .or_default()
                 .push(IntRect::new(
-                    first as i32,
-                    row as i32,
-                    end as i32,
-                    row as i32 + 1,
+                    first as i32 - margin,
+                    row as i32 - margin,
+                    end as i32 - margin,
+                    row as i32 + 1 - margin,
                 ));
         }
     };
-    for (index, values) in cells {
-        let (row, column) = (index / size, index % size);
+    for (row, column, values) in cells {
         run = match run {
             Some((run_row, first, end, run_values))
                 if run_row == row && end == column && run_values == values =>

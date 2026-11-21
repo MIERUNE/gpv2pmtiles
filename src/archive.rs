@@ -182,6 +182,11 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
     match output_format {
         TileOutput::Mvt(_) => {
             ensure_distinct_paths(input, &[output.to_path_buf()], None)?;
+            // Every layer of a vector tile is drawn together, so every
+            // product needs its pyramid at once.
+            products.par_iter_mut().for_each(|product| {
+                build_pyramid(product, options.min_zoom, max_zoom, output_format);
+            });
             write_archive(
                 output,
                 &products,
@@ -196,11 +201,14 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
             let outputs = raster_output_paths(output, &products, options.layer_seq_start)?;
             ensure_distinct_paths(input, &outputs, options.manifest.as_deref())?;
             for (index, ((product, layer_name), output)) in products
-                .iter()
+                .iter_mut()
                 .zip(&layer_names)
                 .zip(outputs.iter())
                 .enumerate()
             {
+                // A raster archive holds one product, so its pyramid lives
+                // only as long as the archive is written.
+                build_pyramid(product, options.min_zoom, max_zoom, output_format);
                 write_archive(
                     output,
                     std::slice::from_ref(product),
@@ -210,6 +218,7 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
                     output_format,
                     Some(options.layer_seq_start + index),
                 )?;
+                product.pyramid = None;
             }
             if let Some(manifest) = &options.manifest {
                 write_manifest(
@@ -224,6 +233,29 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
             Ok(())
         }
     }
+}
+
+/// Builds the pyramid of maxima a product's lattice zooms read, if it has any
+/// and takes its maximum; see [`crate::tile::Pyramid`].
+pub(crate) fn build_pyramid(
+    product: &mut PreparedProduct,
+    min_zoom: u8,
+    max_zoom: u8,
+    output: TileOutput,
+) {
+    if product.spec.reducer != Reducer::Legacy(gpv_products::model::Aggregation::Max) {
+        return;
+    }
+    let levels = (min_zoom..=max_zoom)
+        .filter_map(|zoom| crate::tile::lattice_level(product, zoom, output))
+        .collect::<Vec<_>>();
+    let (Some(&coarsest), Some(&finest)) = (levels.iter().min(), levels.iter().max()) else {
+        return;
+    };
+    let every_band = matches!(output, TileOutput::Raster(_));
+    product.pyramid = Some(crate::tile::Pyramid::build(
+        product, coarsest, finest, every_band,
+    ));
 }
 
 /// Expands a raster output pattern into one archive path per forecast time.
@@ -1714,6 +1746,7 @@ mod tests {
             },
             product_id,
             chunks: Vec::new(),
+            pyramid: None,
         }
     }
 

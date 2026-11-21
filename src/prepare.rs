@@ -288,6 +288,7 @@ pub(crate) fn prepare_product(
         product_id,
         spec,
         chunks,
+        pyramid: None,
     })
 }
 

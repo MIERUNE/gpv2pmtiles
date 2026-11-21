@@ -830,17 +830,49 @@ fn pixel_lookup(ranges: &[(i64, i64)], origin: i64, len: usize) -> Vec<(u32, u32
 /// Coarse source cells count by how many basic cells of theirs fall in a
 /// pixel, without being expanded. These are grid-area statistics, not exact
 /// ground-area averages or exact polygon/pixel intersections.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_pixel_tile(
     product: &crate::model::PreparedProduct,
     zxy: Zxy,
     chunks: &[&[(u64, crate::model::BaseTile)]],
     scales: &[BandScale<'_>],
     layout: RasterLayout,
+    level: u8,
     work: &mut super::reduce::Workspace,
 ) -> Result<Option<Vec<u8>>> {
     let encoding = layout.encoding;
     let spec = &product.spec;
     let bands = encoding.bands();
+
+    let side = layout.image_size() as usize;
+    let corner = (
+        i64::from(zxy.2) * i64::from(layout.size) - i64::from(TILE_BUFFER),
+        i64::from(zxy.1) * i64::from(layout.size) - i64::from(TILE_BUFFER),
+    );
+    if let Some(pyramid) = nested_pyramid(product, level, corner, side) {
+        let mut rgba = encoding.off_grid().repeat(side * side);
+        let mut covered = false;
+        pyramid.window(level, corner, side, |row, column, raw| {
+            let mut values = [0.0; 2];
+            for (b, value) in values.iter_mut().enumerate().take(bands) {
+                match raw[b]
+                    .get()
+                    .and_then(|raw| finish_raw(f64::from(raw), b, spec, &scales[b]))
+                {
+                    Some(finished) => *value = finished,
+                    None => return,
+                }
+            }
+            let index = (row * side + column) * 4;
+            rgba[index..index + 4].copy_from_slice(&encoding.encode(values));
+            covered = true;
+        });
+        if !covered {
+            return Ok(None);
+        }
+        return Ok(Some(encode_png(&rgba, layout.image_size())?));
+    }
+
     let Some(size) = aggregate_pixels(
         product,
         zxy,
@@ -890,6 +922,44 @@ pub(super) fn render_pixel_tile(
         return Ok(None);
     }
     Ok(Some(encode_png(&rgba, layout.image_size())?))
+}
+
+/// The product's pyramid, when it can stand in for gathering a window's
+/// cells: the statistic is a maximum, the pyramid holds the level, and every
+/// pixel of the window holds a cell centre on both axes, so that its maximum
+/// nests.
+///
+/// Which pixels hold a centre depends on the level and the pixel alone, so
+/// neighbouring tiles agree on the pixels they share whichever way they go.
+pub(super) fn nested_pyramid(
+    product: &crate::model::PreparedProduct,
+    level: u8,
+    (top, left): (i64, i64),
+    side: usize,
+) -> Option<&super::Pyramid> {
+    let pyramid = product.pyramid.as_ref()?;
+    if product.spec.reducer != super::Reducer::Legacy(gpv_products::model::Aggregation::Max)
+        || !pyramid.has_level(level)
+    {
+        return None;
+    }
+    let grid = &product.spec.grid_spec;
+    let world = (1u64 << level) as f64;
+    let lng_grid =
+        |pixel: f64| (pixel / world * 360.0 - 180.0 - grid.lng_0) * f64::from(grid.lng_denom);
+    let lat_grid = |pixel: f64| {
+        let latitude = web_mercator_to_lnglat(0.0, pixel / world).1;
+        (latitude - grid.lat_0) * f64::from(grid.lat_denom)
+    };
+    let columns_nest = (0..side).all(|column| {
+        let column = (left + column as i64) as f64;
+        lng_grid(column + 1.0).ceil() > lng_grid(column).ceil()
+    });
+    let rows_nest = (0..side).all(|row| {
+        let row = (top + row as i64) as f64;
+        lat_grid(row).floor() > lat_grid(row + 1.0).floor()
+    });
+    (columns_nest && rows_nest).then_some(pyramid)
 }
 
 /// A tile's pixels: how many across it, how many more beyond each edge, and
