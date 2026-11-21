@@ -923,7 +923,10 @@ fn apply_quantization(
                         "quantizing values"
                     );
                 }
-                if zero_omits[band_index].is_some() {
+                if zero_omits[band_index]
+                    .as_ref()
+                    .is_some_and(|omit| omit.has_stored())
+                {
                     info!(band = %band.name, "omitting physical zero before quantization");
                 }
                 if let Some(omit) = &class_omits[band_index] {

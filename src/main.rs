@@ -103,8 +103,9 @@ struct Cli {
     omit_class: Vec<String>,
 
     /// Before quantization, leave cells whose physical value is exactly zero
-    /// out of the tile on every band. Ignored by bands which cannot represent
-    /// zero.
+    /// out of the tile on every band. A band that cannot represent zero has no
+    /// cell to leave out, but a weighted mean of it can still come out at
+    /// zero, and is left out then.
     #[arg(long)]
     omit_zero: bool,
 

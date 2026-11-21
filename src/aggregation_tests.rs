@@ -431,3 +431,198 @@ fn source_overlap_validation_matches_rectangle_intersections() {
         );
     }
 }
+
+#[test]
+fn remote_support_does_not_change_local_statistics() {
+    let local: Vec<_> = (0..65)
+        .flat_map(|x| {
+            (6000..6065).map(move |y| (x, y, 0, 1 + (i32::from(x) * 17 + i32::from(y) * 31) % 100))
+        })
+        .collect();
+    let mut remote = local.clone();
+    remote.push((0, 0, 0, 1));
+    let grid = LngLatGrid {
+        lng_0: 0.1,
+        lat_0: 0.1,
+        lng_denom: 80.,
+        lat_denom: 120.,
+    };
+    let near = product(&local, grid.clone(), Aggregation::Mean);
+    let far = product(&remote, grid, Aggregation::Mean);
+    let encoding = ColorEncoding::Scalar16 { min: 0., max: 100. };
+    let lat = (near.spec.bounds[1] + near.spec.bounds[3]) / 2.;
+    let y = (crate::geo::lat_to_web_mercator_y(lat) * 64.).floor() as u32;
+    let a = raster(&near, (6, 32, y), encoding);
+    let b = raster(&far, (6, 32, y), encoding);
+    let differences = a
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(b.as_chunks::<4>().0)
+        .filter(|(a, b)| a != b)
+        .count();
+    eprintln!(
+        "remote_support: near_bounds={:?}, far_bounds={:?}, changed_pixels={differences}",
+        near.spec.bounds, far.spec.bounds
+    );
+    assert_eq!(
+        differences, 0,
+        "adding a remote cell changed local raster statistics"
+    );
+}
+
+#[test]
+fn fractional_physical_zero_is_omitted() {
+    let mut product = product(&[(0, 0, 0, -1), (1, 0, 0, 0)], grid(), Aggregation::Mean);
+    product.spec.band_specs[0].reference_value = 0.5;
+    product.spec.omit_zero = crate::quantize::resolve_zero_omits(true, &product.spec.band_specs);
+    let tile = tile::make_layer(
+        &TileContext::new((0, 0, 0)),
+        &product,
+        "test",
+        TileOutput::Raster(RasterLayout::new(ColorEncoding::Scalar16 {
+            min: -1.,
+            max: 1.,
+        })),
+    )
+    .unwrap();
+    eprintln!(
+        "fractional_zero: zero_omit={:?}, raster_present={}",
+        product.spec.omit_zero,
+        tile.is_some()
+    );
+    assert!(
+        tile.is_none(),
+        "the physical mean is zero, but --omit-zero left it in the raster"
+    );
+}
+
+#[test]
+fn missing_band_is_excluded_instead_of_zero_filled() {
+    let mut input = raw(&[(0, 0, 0, 10), (1, 0, 0, 20)], grid());
+    input.product_id.kind = GpvProductElement::GsmWind;
+    input.data.band_specs = vec![
+        BandSpec {
+            name: "u".into(),
+            ..Default::default()
+        },
+        BandSpec {
+            name: "v".into(),
+            ..Default::default()
+        },
+    ];
+    input.data.points.push(PointValue {
+        x: 1,
+        y: 0,
+        point_power: 0,
+        value: 30,
+        band_idx: 1,
+        point_id: 0,
+    });
+    let mut product = prepare::prepare_products(vec![input], true)
+        .unwrap()
+        .pop()
+        .unwrap();
+    product.spec.reducer = Aggregation::Mean;
+    let bytes = tile::make_layer(
+        &TileContext::new((0, 0, 0)),
+        &product,
+        "test",
+        TileOutput::Mvt(MvtLayout::default()),
+    )
+    .unwrap()
+    .unwrap();
+    let reader = fast_mvt::MvtReaderRef::new(&bytes).unwrap();
+    let layer = reader.layers().next().unwrap();
+    let features: Vec<_> = layer.features().collect();
+    eprintln!(
+        "partial_vector: MVT={:?}",
+        features[0].properties_vec().unwrap()
+    );
+    let pixels = raster(
+        &product,
+        (0, 0, 0),
+        ColorEncoding::VectorField {
+            component_limit: 100.,
+        },
+    );
+    let pixel = pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .find(|p| p[2] == 255)
+        .unwrap();
+    let raster_v = (f64::from(pixel[1]) - 128.) * 100. / 127.;
+    eprintln!("partial_vector: raster_v={raster_v}, expected_missing_excluded_v=30");
+    for (_, chunk) in &product.chunks {
+        for (i, xy) in chunk.point_positions.iter().enumerate() {
+            if *xy == (0, 0) {
+                eprintln!(
+                    "partial_vector: missing v after prepare={:?}",
+                    chunk.bands[1].values[i].get()
+                );
+            }
+        }
+    }
+    assert!(
+        (raster_v - 30.).abs() < 0.8,
+        "a missing band became zero before aggregation"
+    );
+}
+
+fn wrapped_product(
+    denom: f32,
+    columns: std::ops::Range<u16>,
+    method: Aggregation,
+) -> PreparedProduct {
+    let cells: Vec<_> = columns
+        .flat_map(|x| (0..200).map(move |y| (x, y, 0, 100)))
+        .collect();
+    let mut p = product(
+        &cells,
+        LngLatGrid {
+            lng_0: 0.,
+            lat_0: -1.,
+            lng_denom: denom,
+            lat_denom: 100.,
+        },
+        method,
+    );
+    p.spec.fill[0] = Some(0);
+    p
+}
+
+#[test]
+fn wrapped_constant_field_has_constant_mean() {
+    let product = wrapped_product(3.3333333, 890..910, Aggregation::Mean);
+    let frame = raster(
+        &product,
+        (0, 0, 0),
+        ColorEncoding::Scalar24 {
+            base: 0.,
+            interval: 0.01,
+        },
+    );
+    let offset = (257 * 514 + 128) * 4;
+    let px = &frame[offset..offset + 4];
+    let code = u32::from(px[0]) * 65536 + u32::from(px[1]) * 256 + u32::from(px[2]);
+    eprintln!("wrapped_constant: decoded_mean={}", f64::from(code) * 0.01);
+    assert_eq!(
+        code, 10000,
+        "a constant field changed under longitude wrapping"
+    );
+}
+
+#[test]
+fn wrapped_constant_field_percentile_does_not_panic() {
+    let product =
+        wrapped_product(1_000_000.0 / 9990.0, 26950..27110, "p95".parse().unwrap());
+    let _frame = raster(
+        &product,
+        (0, 0, 0),
+        ColorEncoding::Scalar24 {
+            base: 0.,
+            interval: 0.01,
+        },
+    );
+}

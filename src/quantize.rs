@@ -87,10 +87,9 @@ impl BandQuantize {
 /// fractional mean until it has been classified. Returns a class index for a
 /// quantized band, or the unchanged raw value otherwise.
 pub(crate) fn postprocess(raw: f64, index: usize, spec: &crate::model::TilesetSpec) -> Option<f64> {
-    if spec.omit_zero[index]
-        .as_ref()
-        .is_some_and(|omit| omit.contains_fractional(raw))
-    {
+    if spec.omit_zero[index].as_ref().is_some_and(|omit| {
+        omit.contains_fractional(raw) || is_physical_zero(raw, &spec.band_specs[index])
+    }) {
         return None;
     }
     if let Some(quantize) = &spec.quantize[index] {
@@ -114,6 +113,16 @@ pub(crate) fn postprocess(raw: f64, index: usize, spec: &crate::model::TilesetSp
     } else {
         Some(raw)
     }
+}
+
+/// Whether a fractional raw value is physical zero, to within rounding.
+///
+/// The scaling is `(reference + raw * 2^binary) * 10^-decimal`, so zero is
+/// where `reference + raw * 2^binary` vanishes; the tolerance is a sliver of
+/// one raw step.
+fn is_physical_zero(raw: f64, band: &BandSpec) -> bool {
+    let step = 2f64.powi(i32::from(band.binary_scale));
+    (f64::from(band.reference_value) + raw * step).abs() <= step * 1e-9
 }
 
 /// Resolves the raw `--quantize` arguments against the bands of the product.
@@ -290,6 +299,13 @@ impl BandOmit {
         self.stored.iter().any(|&v| f64::from(v) == raw)
     }
 
+    /// Whether some raw value stands for an omitted physical value. A band
+    /// that cannot represent zero has none, and omits only a fractional
+    /// statistic that comes out at it.
+    pub(crate) fn has_stored(&self) -> bool {
+        !self.stored.is_empty()
+    }
+
     pub fn physical(&self) -> &[f64] {
         &self.physical
     }
@@ -307,11 +323,13 @@ pub(crate) fn resolve_zero_omits(
         return vec![None; band_specs.len()];
     }
 
+    // Every band takes the omission: a weighted mean is fractional and can
+    // land on physical zero even where no raw value does.
     band_specs
         .iter()
         .map(|band| {
-            physical_to_raw_exact(0.0, band).map(|raw| BandOmit {
-                stored: vec![raw],
+            Some(BandOmit {
+                stored: physical_to_raw_exact(0.0, band).into_iter().collect(),
                 physical: vec![0.0],
             })
         })
@@ -694,15 +712,23 @@ mod tests {
         assert!(omits[0].as_ref().unwrap().contains(0));
     }
 
+    /// No raw value is physical zero here, so no cell is left out, but a mean
+    /// halfway between two raw steps is, and goes.
     #[test]
-    fn omit_zero_is_a_no_op_when_physical_zero_is_not_representable() {
+    fn omit_zero_reaches_only_a_fractional_zero_when_no_raw_value_is_zero() {
         let band = BandSpec {
             name: "value".to_string(),
             reference_value: 0.5,
             ..Default::default()
         };
 
-        assert!(resolve_zero_omits(true, &[band])[0].is_none());
+        let omit = resolve_zero_omits(true, std::slice::from_ref(&band))[0]
+            .clone()
+            .unwrap();
+        assert!(!omit.has_stored());
+        assert!((-3..=3).all(|raw| !omit.contains(raw)));
+        assert!(is_physical_zero(-0.5, &band));
+        assert!(!is_physical_zero(-0.25, &band));
     }
 
     #[test]

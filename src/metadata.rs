@@ -271,7 +271,11 @@ pub(crate) fn generate_metadata(
                 .iter()
                 .zip(&product.spec.omit_zero)
                 .filter_map(|(band, omit)| {
-                    Some((band.name.clone(), json!(omit.as_ref()?.physical())))
+                    // A band that cannot represent zero omits it only from
+                    // a weighted statistic, so it is listed only then.
+                    let omit = omit.as_ref()?;
+                    (omit.has_stored() || product.spec.reducer.is_weighted())
+                        .then(|| (band.name.clone(), json!(omit.physical())))
                 })
                 .collect::<Map<String, Value>>()
         })

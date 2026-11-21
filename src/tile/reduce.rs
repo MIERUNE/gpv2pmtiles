@@ -225,6 +225,9 @@ pub(super) struct Workspace {
     pub(super) pixels: Vec<Accumulator>,
     /// The statistic each touched pixel uses; see [`effective_reducer`].
     pub(super) methods: Vec<Reducer>,
+    /// How many basic cells each touched pixel holds, from the longitude
+    /// naming that reached it.
+    pub(super) capacities: Vec<u64>,
     pub(super) touched: Vec<u32>,
 }
 
@@ -246,6 +249,8 @@ impl Workspace {
             self.pixels.resize(count * bands, Accumulator::default());
             self.methods.clear();
             self.methods.resize(count, Reducer::Mean);
+            self.capacities.clear();
+            self.capacities.resize(count, 0);
         }
     }
 }
@@ -379,7 +384,9 @@ impl Accumulator {
                     scratch.push(entry.value, entry.weight);
                     head = entry.next;
                 }
-                return scratch.reduce_fractional(reducer, capacity, fill);
+                // Never short of the cells counted, which a product reaching
+                // round the whole world can bring to one pixel twice.
+                return scratch.reduce_fractional(reducer, capacity.max(self.weight), fill);
             }
         })
     }

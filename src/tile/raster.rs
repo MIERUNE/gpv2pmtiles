@@ -768,11 +768,16 @@ pub(super) fn uses_pixel_aggregation(spec: &TilesetSpec, zxy: Zxy, tile_size: u3
     let across = f64::from(tile_size) * f64::from(1u32 << zxy.0);
     let grid = &spec.grid_spec;
     let cell_width = across / (360.0 * f64::from(grid.lng_denom));
-    let (south, north) = (spec.bounds[1], spec.bounds[3]);
-    let least_stretched = if south <= 0.0 && north >= 0.0 {
+    // The grid's own frame, not the cells that happen to be stored: one cell
+    // far away must not change how the rest of a time is drawn, and every
+    // time of a product has to draw alike. The frame runs from its origin
+    // away from it, so the origin is its latitude nearest the equator unless
+    // the frame crosses the equator going the other way.
+    let towards_equator = (grid.lat_0 > 0.0) != (grid.lat_denom > 0.0);
+    let least_stretched = if towards_equator || grid.lat_0 == 0.0 {
         0.0
     } else {
-        south.abs().min(north.abs())
+        grid.lat_0.abs()
     }
     .min(MAX_MERCATOR_LATITUDE);
     let half = 0.5 / f64::from(grid.lat_denom);
@@ -890,16 +895,6 @@ pub(super) fn render_pixel_tile(
             })
         })
         .collect::<Vec<_>>();
-    // Capacity is the unshifted naming's, which a shift of whole cells leaves
-    // as it is.
-    let columns = axis_ranges((0..size).map(|column| {
-        let column = left + column as f64;
-        (
-            lng_grid(column),
-            lng_grid(column + 0.5),
-            lng_grid(column + 1.0),
-        )
-    }));
     if namings.is_empty() {
         return Ok(None);
     }
@@ -923,6 +918,7 @@ pub(super) fn render_pixel_tile(
         scratch,
         pixels,
         methods,
+        capacities,
         touched,
     } = work;
 
@@ -976,7 +972,8 @@ pub(super) fn render_pixel_tile(
                         let states = &mut pixels[index * bands..(index + 1) * bands];
                         if states[0].is_empty() {
                             touched.push(index as u32);
-                            let capacity = span(&rows, row) * span(&columns, column);
+                            let capacity = span(&rows, row) * span(column_ranges, column);
+                            capacities[index] = capacity;
                             methods[index] = super::reduce::effective_reducer(method, capacity);
                         }
                         for (b, state) in states.iter_mut().enumerate() {
@@ -997,8 +994,7 @@ pub(super) fn render_pixel_tile(
     let mut covered = false;
     for &index in touched.iter() {
         let index = index as usize;
-        let (row, column) = ((index / size) as u32, (index % size) as u32);
-        let capacity = span(&rows, row) * span(&columns, column);
+        let capacity = capacities[index];
         let mut values = [0.0; 2];
         let mut present = true;
         for (b, value) in values.iter_mut().enumerate().take(bands) {

@@ -200,10 +200,13 @@ pub(crate) fn prepare_product(
         let y1 = ((my1 - buffer) * (1 << base_z) as f64).floor() as i32;
         let y2 = ((my2 + buffer) * (1 << base_z) as f64).ceil() as i32 - 1;
 
+        // A band the cell has no value for stays missing. Left at the
+        // default it read as a stored zero, which a statistic then counted.
         let mut tile_point = TilePoint {
             x: point.x,
             y: point.y,
             point_power: point.point_power,
+            values: [CompactOptI32::NONE; 4],
             ..Default::default()
         };
         for point_band in point_bands {
