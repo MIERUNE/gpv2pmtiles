@@ -222,7 +222,6 @@ fn prepare_product(
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone, Utc};
     use gpv_products::{
         model::{BandSpec, LngLatGrid},
         products::{
@@ -230,12 +229,13 @@ mod tests {
             PointValue, ProductData,
         },
     };
+    use jiff::Timestamp;
 
     use super::*;
 
     #[test]
     fn prepared_tiles_keep_original_grid_coordinates() {
-        let datetime = Utc.timestamp_opt(1_570_871_100, 0).unwrap();
+        let datetime = Timestamp::from_second(1_570_871_100).unwrap();
         let product_id = GpvProductIdentifier {
             kind: GpvProductElement::HiresNowcastIntensity,
             datetime,

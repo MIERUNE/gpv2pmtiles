@@ -1,9 +1,9 @@
 use std::io::Read;
 
 use bit_vec::BitVec;
-use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use foldhash::HashMap;
 use itertools::Itertools;
+use jiff::{SignedDuration, Timestamp, civil::DateTime, tz::Offset};
 use tinygrib2::{
     MessageReader,
     message::{DataRepresentationSectionHeader, IdentificationSectionHeader},
@@ -129,6 +129,32 @@ fn first_statistical_process(interval: &TimeInterval) -> tinygrib2::Result<u8> {
         })
 }
 
+fn utc_datetime(
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+) -> tinygrib2::Result<Timestamp> {
+    let invalid = || {
+        tinygrib2::Error::InvalidData(format!(
+            "{year}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} is not a valid UTC time"
+        ))
+    };
+    let datetime = DateTime::new(
+        year.try_into().map_err(|_| invalid())?,
+        month.try_into().map_err(|_| invalid())?,
+        day.try_into().map_err(|_| invalid())?,
+        hour.try_into().map_err(|_| invalid())?,
+        minute.try_into().map_err(|_| invalid())?,
+        second.try_into().map_err(|_| invalid())?,
+        0,
+    )
+    .map_err(|_| invalid())?;
+    Offset::UTC.to_timestamp(datetime).map_err(|_| invalid())
+}
+
 /// When a field is valid.
 ///
 /// A statistical product covers a period rather than an instant, and GRIB2
@@ -141,50 +167,38 @@ fn first_statistical_process(interval: &TimeInterval) -> tinygrib2::Result<u8> {
 /// See templates 4.8 and 4.11: the forecast time is the start of the overall
 /// interval, and the explicit date is its end.
 fn valid_datetime(
-    reference_datetime: DateTime<Utc>,
+    reference_datetime: Timestamp,
     template: &ProductDefinitionTemplate4_0,
     interval: Option<&TimeInterval>,
-) -> tinygrib2::Result<DateTime<Utc>> {
+) -> tinygrib2::Result<Timestamp> {
     if let Some(interval) = interval {
         // Present but unreadable is not the same as absent. Falling back to the
         // start of the period would give a plausible time that is quietly an
         // accumulation period wrong, which nothing downstream could detect.
-        return Utc
-            .with_ymd_and_hms(
-                i32::from(interval.year),
-                u32::from(interval.month),
-                u32::from(interval.day),
-                u32::from(interval.hour),
-                u32::from(interval.minute),
-                u32::from(interval.second),
-            )
-            .single()
-            .ok_or_else(|| {
-                tinygrib2::Error::InvalidData(format!(
-                    "the statistical period ends at {}-{:02}-{:02} {:02}:{:02}:{:02}, \
-                     which is not a valid time",
-                    interval.year,
-                    interval.month,
-                    interval.day,
-                    interval.hour,
-                    interval.minute,
-                    interval.second
-                ))
-            });
+        return utc_datetime(
+            interval.year,
+            interval.month,
+            interval.day,
+            interval.hour,
+            interval.minute,
+            interval.second,
+        );
     }
 
     let offset = i64::from(template.forecast_time);
-    Ok(reference_datetime
-        + match template.indicator_of_unit_of_time_range {
-            0 => Duration::minutes(offset),
-            1 => Duration::hours(offset),
-            2 => Duration::days(offset),
-            unit => {
-                return Err(tinygrib2::Error::UnsupportedData(format!(
-                    "time range unit {unit} is not supported"
-                )));
-            }
-        })
+    let offset = match template.indicator_of_unit_of_time_range {
+        0 => SignedDuration::from_mins(offset),
+        1 => SignedDuration::from_hours(offset),
+        2 => SignedDuration::from_hours(offset * 24),
+        unit => {
+            return Err(tinygrib2::Error::UnsupportedData(format!(
+                "time range unit {unit} is not supported"
+            )));
+        }
+    };
+    reference_datetime.checked_add(offset).map_err(|error| {
+        tinygrib2::Error::InvalidData(format!("forecast time is out of range: {error}"))
+    })
 }
 
 fn grid_corner(
@@ -346,7 +360,7 @@ pub struct GridSquareMessageReader {
     retained_product: Option<String>,
     pub products: HashMap<GpvProductIdentifier, ProductData>,
     /// Track latest reference_datetime for each kind path
-    pub latest_reference_times: HashMap<String, DateTime<Utc>>,
+    pub latest_reference_times: HashMap<String, Timestamp>,
 }
 
 impl GridSquareMessageReader {
@@ -418,24 +432,23 @@ impl<R: Read> MessageReader<R> for GridSquareMessageReader {
         reader: &mut std::io::Take<&mut R>,
     ) -> tinygrib2::Result<()> {
         let ids = self.ids.as_ref().unwrap();
-        let reference_datetime = Utc.from_utc_datetime(
-            &NaiveDate::from_ymd_opt(ids.year as i32, ids.month as u32, ids.day as u32)
-                .unwrap()
-                .and_time(
-                    NaiveTime::from_hms_opt(ids.hour as u32, ids.minute as u32, ids.second as u32)
-                        .unwrap(),
-                ),
-        );
+        let reference_datetime = utc_datetime(
+            ids.year, ids.month, ids.day, ids.hour, ids.minute, ids.second,
+        )?;
         (self.current_product_id, self.current_band) = if pds.template_number == 50031 {
             // Special case (typhoon storm)
             let tmpl = ProductDefinitionTemplate4_50031::read(reader)?;
             assert_eq!(tmpl.background_process, 170);
-            let datetime = match tmpl.indicator_of_unit_of_time_range_forecast {
-                0 => reference_datetime + Duration::minutes(tmpl.forecast_time as i64),
-                1 => reference_datetime + Duration::hours(tmpl.forecast_time as i64),
-                2 => reference_datetime + Duration::days(tmpl.forecast_time as i64),
+            let offset = i64::from(tmpl.forecast_time);
+            let offset = match tmpl.indicator_of_unit_of_time_range_forecast {
+                0 => SignedDuration::from_mins(offset),
+                1 => SignedDuration::from_hours(offset),
+                2 => SignedDuration::from_hours(offset * 24),
                 v => unimplemented!("{}", v),
             };
+            let datetime = reference_datetime.checked_add(offset).map_err(|error| {
+                tinygrib2::Error::InvalidData(format!("forecast time is out of range: {error}"))
+            })?;
             (
                 GpvProductIdentifier {
                     kind: GpvProductElement::TyphoonStorm,
@@ -947,7 +960,7 @@ mod tests {
     /// reading `forecast_time` without anything failing.
     #[test]
     fn a_period_ends_the_field_but_an_instant_is_offset_from_the_reference() {
-        let reference = Utc.with_ymd_and_hms(2019, 10, 12, 9, 0, 0).unwrap();
+        let reference = utc_datetime(2019, 10, 12, 9, 0, 0).unwrap();
 
         // A one-hour accumulation whose period runs 09:00-10:00 is valid at
         // 10:00, which is what `FH01` in the file name means. The forecast time
@@ -955,7 +968,7 @@ mod tests {
         let accumulation = interval(2019, 10, 12, 10, 0);
         assert_eq!(
             valid_datetime(reference, &forecast_template(0, 0), Some(&accumulation)).unwrap(),
-            Utc.with_ymd_and_hms(2019, 10, 12, 10, 0, 0).unwrap()
+            utc_datetime(2019, 10, 12, 10, 0, 0).unwrap()
         );
         // The last message of the same file: period 14:00-15:00, so +6h.
         assert_eq!(
@@ -965,22 +978,22 @@ mod tests {
                 Some(&interval(2019, 10, 12, 15, 0))
             )
             .unwrap(),
-            Utc.with_ymd_and_hms(2019, 10, 12, 15, 0, 0).unwrap()
+            utc_datetime(2019, 10, 12, 15, 0, 0).unwrap()
         );
 
         // An instantaneous product has no period, and is offset from the
         // reference by its forecast time.
         assert_eq!(
             valid_datetime(reference, &forecast_template(30, 0), None).unwrap(),
-            Utc.with_ymd_and_hms(2019, 10, 12, 9, 30, 0).unwrap()
+            utc_datetime(2019, 10, 12, 9, 30, 0).unwrap()
         );
         assert_eq!(
             valid_datetime(reference, &forecast_template(6, 1), None).unwrap(),
-            Utc.with_ymd_and_hms(2019, 10, 12, 15, 0, 0).unwrap()
+            utc_datetime(2019, 10, 12, 15, 0, 0).unwrap()
         );
         assert_eq!(
             valid_datetime(reference, &forecast_template(2, 2), None).unwrap(),
-            Utc.with_ymd_and_hms(2019, 10, 14, 9, 0, 0).unwrap()
+            utc_datetime(2019, 10, 14, 9, 0, 0).unwrap()
         );
     }
 
@@ -989,7 +1002,7 @@ mod tests {
     /// is quietly a whole accumulation period wrong.
     #[test]
     fn an_unreadable_period_is_reported_rather_than_replaced() {
-        let reference = Utc.with_ymd_and_hms(2019, 10, 12, 9, 0, 0).unwrap();
+        let reference = utc_datetime(2019, 10, 12, 9, 0, 0).unwrap();
         let broken = interval(2019, 13, 40, 25, 0);
 
         let error = valid_datetime(reference, &forecast_template(0, 0), Some(&broken)).unwrap_err();
@@ -1000,8 +1013,51 @@ mod tests {
     }
 
     #[test]
+    fn forecast_offsets_cross_leap_days_and_support_negative_values() {
+        let reference = "2024-02-28T23:45:00Z".parse().unwrap();
+        for (offset, unit, expected) in [
+            (30, 0, "2024-02-29T00:15:00Z"),
+            (24, 1, "2024-02-29T23:45:00Z"),
+            (2, 2, "2024-03-01T23:45:00Z"),
+            (-30, 0, "2024-02-28T23:15:00Z"),
+            (-24, 1, "2024-02-27T23:45:00Z"),
+            (-2, 2, "2024-02-26T23:45:00Z"),
+        ] {
+            assert_eq!(
+                valid_datetime(reference, &forecast_template(offset, unit), None).unwrap(),
+                expected.parse::<Timestamp>().unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_range_forecast_times_are_reported() {
+        let reference = "2024-02-28T23:45:00Z".parse().unwrap();
+        for offset in [i32::MIN, i32::MAX] {
+            let error = valid_datetime(reference, &forecast_template(offset, 2), None).unwrap_err();
+            assert!(matches!(error, tinygrib2::Error::InvalidData(_)));
+        }
+    }
+
+    #[test]
+    fn invalid_grib_datetime_components_are_reported_without_wrapping() {
+        for (year, month, day, hour, minute, second) in [
+            (2023, 2, 29, 0, 0, 0),
+            (2024, 255, 1, 0, 0, 0),
+            (2024, 1, 255, 0, 0, 0),
+            (2024, 1, 1, 255, 0, 0),
+            (2024, 1, 1, 0, 255, 0),
+            (2024, 1, 1, 0, 0, 255),
+            (u16::MAX, 1, 1, 0, 0, 0),
+        ] {
+            let error = utc_datetime(year, month, day, hour, minute, second).unwrap_err();
+            assert!(matches!(error, tinygrib2::Error::InvalidData(_)));
+        }
+    }
+
+    #[test]
     fn an_unsupported_time_unit_is_reported_rather_than_panicking() {
-        let reference = Utc.with_ymd_and_hms(2019, 10, 12, 9, 0, 0).unwrap();
+        let reference = utc_datetime(2019, 10, 12, 9, 0, 0).unwrap();
         let error = valid_datetime(reference, &forecast_template(1, 13), None).unwrap_err();
         assert!(matches!(error, tinygrib2::Error::UnsupportedData(_)));
     }

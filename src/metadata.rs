@@ -263,11 +263,23 @@ pub(crate) fn generate_metadata(
                 metadata.insert("product".into(), json!(product.spec.name));
                 metadata.insert(
                     "reference_time".into(),
-                    json!(product.product_id.reference_datetime.to_rfc3339()),
+                    json!(
+                        product
+                            .product_id
+                            .reference_datetime
+                            .strftime("%Y-%m-%dT%H:%M:%S%.f%:z")
+                            .to_string()
+                    ),
                 );
                 metadata.insert(
                     "valid_time".into(),
-                    json!(product.product_id.datetime.to_rfc3339()),
+                    json!(
+                        product
+                            .product_id
+                            .datetime
+                            .strftime("%Y-%m-%dT%H:%M:%S%.f%:z")
+                            .to_string()
+                    ),
                 );
             }
             if let Some(sequence) = sequence {
