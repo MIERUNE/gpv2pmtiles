@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use tinygrib2::templates::{GridDefinitionTemplate3_0, ProductDefinitionTemplate4_0};
 
 use crate::model::{Aggregation, BandSpec, LngLatGrid};
@@ -31,8 +31,8 @@ pub fn get_product_id_and_band(
     tmpl0: &ProductDefinitionTemplate4_0,
     gds_tmpl: &GridDefinitionTemplate3_0,
     statistical_process: Option<u8>,
-    reference_datetime: DateTime<Utc>,
-    datetime: DateTime<Utc>,
+    reference_datetime: Timestamp,
+    datetime: Timestamp,
     ensemble: Option<Ensemble>,
 ) -> (GpvProductIdentifier, u8) {
     use GpvProductElement::*;
@@ -534,8 +534,8 @@ pub fn get_generating_process_by_generating_process_str(
 #[derive(Default, Debug, PartialEq, Eq, Hash, Clone)]
 pub struct GpvProductIdentifier {
     pub kind: GpvProductElement,
-    pub datetime: DateTime<Utc>,
-    pub reference_datetime: DateTime<Utc>,
+    pub datetime: Timestamp,
+    pub reference_datetime: Timestamp,
     pub generating_process: GeneratingProcessType,
     pub surface: FixedSurface,
     pub ensemble: Option<Ensemble>,
@@ -671,8 +671,8 @@ impl GpvProductIdentifier {
     /// Gets the full path of the product
     pub fn path(&self) -> String {
         let kind_path = self.kind_path();
-        let reference_datetime = &self.reference_datetime.format("%Y%m%d%H%M");
-        let target_datetime = &self.datetime.format("%Y%m%d%H%M");
+        let reference_datetime = &self.reference_datetime.strftime("%Y%m%d%H%M");
+        let target_datetime = &self.datetime.strftime("%Y%m%d%H%M");
         let surface = self
             .surface
             .suffix()
@@ -1195,7 +1195,22 @@ pub struct Ensemble {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+
+    #[test]
+    fn product_paths_keep_utc_reference_and_valid_times() {
+        let product = GpvProductIdentifier {
+            kind: GpvProductElement::HiresNowcastIntensity,
+            reference_datetime: "2019-10-12T18:05:00+09:00".parse().unwrap(),
+            datetime: "2019-10-12T18:10:00+09:00".parse().unwrap(),
+            generating_process: GeneratingProcessType::Forecast,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            product.path(),
+            "forecast/hrnowc/201910120905/201910120910_intensity"
+        );
+    }
 
     #[test]
     fn test_path_parts_roundtrip() {
@@ -1320,8 +1335,8 @@ mod tests {
             // Create a dummy product identifier to get path_parts
             let product_id = GpvProductIdentifier {
                 kind: element,
-                datetime: Utc::now(),
-                reference_datetime: Utc::now(),
+                datetime: Timestamp::now(),
+                reference_datetime: Timestamp::now(),
                 generating_process: GeneratingProcessType::Forecast,
                 surface: FixedSurface::Surface,
                 ensemble: None,
@@ -1521,8 +1536,8 @@ mod tests {
             // Create a dummy product identifier to get the gen_process string
             let product_id = GpvProductIdentifier {
                 kind: GpvProductElement::HiresNowcastIntensity,
-                datetime: Utc::now(),
-                reference_datetime: Utc::now(),
+                datetime: Timestamp::now(),
+                reference_datetime: Timestamp::now(),
                 generating_process: process,
                 surface: FixedSurface::Surface,
                 ensemble: None,

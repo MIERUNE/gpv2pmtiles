@@ -344,8 +344,8 @@ fn write_manifest(
             let url = relative_url(directory, output)?;
             let mut entry = serde_json::json!({
                 "url": url,
-                "valid_time": product.product_id.datetime.to_rfc3339(),
-                "reference_time": product.product_id.reference_datetime.to_rfc3339(),
+                "valid_time": product.product_id.datetime.strftime("%Y-%m-%dT%H:%M:%S%.f%:z").to_string(),
+                "reference_time": product.product_id.reference_datetime.strftime("%Y-%m-%dT%H:%M:%S%.f%:z").to_string(),
             });
             // The extremes belong to one forecast time rather than to the set:
             // a later hour can hold a jet the first one did not.
@@ -430,7 +430,7 @@ fn raster_output_paths(
                         &product
                             .product_id
                             .datetime
-                            .format("%Y%m%d%H%M%S")
+                            .strftime("%Y%m%d%H%M%S")
                             .to_string(),
                     )
                     .replace(
@@ -438,7 +438,7 @@ fn raster_output_paths(
                         &product
                             .product_id
                             .reference_datetime
-                            .format("%Y%m%d%H%M%S")
+                            .strftime("%Y%m%d%H%M%S")
                             .to_string(),
                     ),
             )
@@ -832,7 +832,7 @@ fn select_products<T: IdentifiedProduct>(
         let before = products.len();
         products.retain(|product| {
             let product_id = product.product_id();
-            (product_id.datetime - product_id.reference_datetime).num_minutes() >= minutes
+            (product_id.datetime - product_id.reference_datetime).as_mins() >= minutes
         });
         ensure!(
             !products.is_empty(),
@@ -1227,6 +1227,31 @@ mod tests {
     }
 
     #[test]
+    fn raster_metadata_keeps_rfc3339_utc_times() {
+        let mut products = [product(5, GeneratingProcessType::Forecast)];
+        products[0]
+            .spec
+            .band_specs
+            .push(gpv_products::model::BandSpec::default());
+        let metadata = metadata::generate_metadata(
+            "wind",
+            &products,
+            &["wind".to_string()],
+            [0.0; 4],
+            metadata::MetadataOptions {
+                min_zoom: 0,
+                max_zoom: 0,
+                output: TileOutput::Raster(ColorEncoding::Scalar16 { min: 0.0, max: 1.0 }),
+                sequence: None,
+                range: None,
+            },
+        );
+
+        assert_eq!(metadata["reference_time"], "2019-10-12T09:05:00+00:00");
+        assert_eq!(metadata["valid_time"], "2019-10-12T09:10:00+00:00");
+    }
+
+    #[test]
     fn one_raster_time_accepts_a_plain_output_path() {
         let products = [product(0, GeneratingProcessType::Forecast)];
         assert_eq!(
@@ -1462,17 +1487,17 @@ mod tests {
     }
 
     fn product(minutes: i64, process: GeneratingProcessType) -> PreparedProduct {
-        use chrono::{TimeZone, Utc};
         use gpv_products::{
             model::{Aggregation, LngLatGrid},
             products::{GpvProductElement, GpvProductIdentifier},
         };
+        use jiff::Timestamp;
 
-        let reference = Utc.timestamp_opt(1_570_871_100, 0).unwrap();
+        let reference = Timestamp::from_second(1_570_871_100).unwrap();
         let product_id = GpvProductIdentifier {
             kind: GpvProductElement::HiresNowcastIntensity,
             reference_datetime: reference,
-            datetime: reference + chrono::Duration::minutes(minutes),
+            datetime: reference + jiff::SignedDuration::from_mins(minutes),
             generating_process: process,
             ..Default::default()
         };
@@ -1502,7 +1527,7 @@ mod tests {
         products
             .iter()
             .map(|product| {
-                (product.product_id.datetime - product.product_id.reference_datetime).num_minutes()
+                (product.product_id.datetime - product.product_id.reference_datetime).as_mins()
             })
             .collect()
     }

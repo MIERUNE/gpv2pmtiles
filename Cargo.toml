@@ -33,7 +33,7 @@ tracing-subscriber = "0.3.23"
 png = "0.18.1"
 
 [dev-dependencies]
-chrono = "0.4.45"
+jiff = { version = "1.0.1", default-features = false, features = ["std"] }
 fast-mvt = { version = "0.7.0", default-features = false, features = ["writer", "reader"] }
 
 [profile.release]
