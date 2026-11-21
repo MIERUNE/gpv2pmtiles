@@ -26,8 +26,44 @@ use crate::{
     tile::{BandScale, Point, PointMap, Zxy},
 };
 
-/// Side length in pixels of a raster tile.
+/// Side length in pixels of a raster tile, unless `--raster-size` says otherwise.
 pub(crate) const TILE_EXTENT: u32 = 512;
+
+/// The tile sizes `--raster-size` accepts.
+pub(crate) const TILE_SIZES: [u32; 2] = [256, 512];
+
+/// What a raster tile is: how its pixels encode values, and how many there are.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RasterLayout {
+    pub(crate) encoding: ColorEncoding,
+    /// Pixels across the tile, without the margin.
+    pub(crate) size: u32,
+}
+
+impl RasterLayout {
+    pub(crate) fn new(encoding: ColorEncoding) -> Self {
+        Self {
+            encoding,
+            size: TILE_EXTENT,
+        }
+    }
+
+    /// The side of the stored image: the tile plus its margin on both sides.
+    pub(crate) fn image_size(self) -> u32 {
+        self.size + 2 * TILE_BUFFER
+    }
+
+    /// How many zooms deeper than a [`TILE_EXTENT`] tile one of this size
+    /// lies on the same pixels.
+    ///
+    /// The pixels of a zoom are fixed by how many there are around the world,
+    /// the tile size times `2^z`, so a 256-pixel tile at `z + 1` holds exactly
+    /// the pixels of a quarter of a 512-pixel tile at `z`. Shifting the zoom by
+    /// this keeps the content, and the aggregation behind it, the same.
+    pub(crate) fn zoom_offset(self) -> u8 {
+        (TILE_EXTENT / self.size).trailing_zeros() as u8
+    }
+}
 
 /// How the band values of one grid cell become a pixel.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -277,7 +313,7 @@ impl ColorEncoding {
     /// Always opaque. For a vector field the components also sit at zero, so a
     /// client that ignores the mask sees calm air rather than a hard edge of
     /// maximum wind.
-    fn off_grid(&self) -> [u8; 4] {
+    pub(super) fn off_grid(&self) -> [u8; 4] {
         match self {
             Self::Scalar24 { .. } => [0, 0, 0, 255],
             Self::Scalar16 { .. } => [0, 0, 0, 255],
@@ -399,7 +435,9 @@ fn signed_code(value: f64, component_limit: f64) -> u8 {
 /// reach.
 pub(crate) const TILE_BUFFER: u32 = 1;
 
-/// The side of the stored image: the tile plus its margin on both sides.
+/// The side of the stored image of a default tile: the tile plus its margin on
+/// both sides.
+#[cfg(test)]
 pub(crate) const IMAGE_EXTENT: u32 = TILE_EXTENT + 2 * TILE_BUFFER;
 
 /// The source grid of one tile, resampled onto a regular lattice.
@@ -643,8 +681,9 @@ pub(super) fn render_raster_tile(
     zxy: Zxy,
     deduped_points: &PointMap<(u32, u32), Point>,
     band_scales: &[BandScale<'_>],
-    encoding: ColorEncoding,
+    layout: RasterLayout,
 ) -> Result<Option<Vec<u8>>> {
+    let encoding = layout.encoding;
     let bands = encoding.bands();
     if band_scales.len() < bands {
         return Ok(None);
@@ -661,7 +700,7 @@ pub(super) fn render_raster_tile(
         .any(|band| band.is_quantized());
 
     let spec = &tileset_spec.grid_spec;
-    let size = IMAGE_EXTENT as usize;
+    let size = layout.image_size() as usize;
     let mut pixels = encoding.off_grid().repeat(size * size);
     let mut covered = false;
 
@@ -672,9 +711,9 @@ pub(super) fn render_raster_tile(
     // byte-for-byte on the neighbour's copy of it. Working from the corner
     // rounds twice, and the seam disagreed by a code.
     let (z, tile_x, tile_y) = zxy;
-    let pixels_across = f64::from(TILE_EXTENT) * f64::from(1u32 << z);
+    let pixels_across = f64::from(layout.size) * f64::from(1u32 << z);
     let position = |tile: u32, index: usize| {
-        (f64::from(tile) * f64::from(TILE_EXTENT) + index as f64 + 0.5 - f64::from(TILE_BUFFER))
+        (f64::from(tile) * f64::from(layout.size) + index as f64 + 0.5 - f64::from(TILE_BUFFER))
             / pixels_across
     };
     // A whole turn of longitude, in grid coordinates, for the products whose
@@ -713,12 +752,12 @@ pub(super) fn render_raster_tile(
     if !covered {
         return Ok(None);
     }
-    Ok(Some(encode_png(&pixels)?))
+    Ok(Some(encode_png(&pixels, layout.image_size())?))
 }
 
-fn encode_png(pixels: &[u8]) -> Result<Vec<u8>> {
+fn encode_png(pixels: &[u8], image_size: u32) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
-    let mut encoder = png::Encoder::new(&mut buffer, IMAGE_EXTENT, IMAGE_EXTENT);
+    let mut encoder = png::Encoder::new(&mut buffer, image_size, image_size);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     // Leaves the adaptive row filter this preset selects in place. A field is
@@ -1338,7 +1377,7 @@ mod tests {
             }
         }
 
-        let png = encode_png(&pixels).unwrap();
+        let png = encode_png(&pixels, IMAGE_EXTENT).unwrap();
         assert!(
             png.len() < pixels.len() / 100,
             "expected the filters to flatten the tile, but {} bytes came out of {}",
@@ -1494,7 +1533,7 @@ mod tests {
             .repeat((IMAGE_EXTENT * IMAGE_EXTENT) as usize);
         pixels[..4].copy_from_slice(&[10, 200, 255, 255]);
 
-        let png = encode_png(&pixels).unwrap();
+        let png = encode_png(&pixels, IMAGE_EXTENT).unwrap();
         let decoder = png::Decoder::new(std::io::Cursor::new(&png));
         let mut reader = decoder.read_info().unwrap();
         let mut decoded = vec![0; reader.output_buffer_size().unwrap()];

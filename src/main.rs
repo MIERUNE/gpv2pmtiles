@@ -161,6 +161,13 @@ struct Cli {
     #[arg(long, value_name = "SPEC", verbatim_doc_comment)]
     raster: Option<String>,
 
+    /// Pixels across a --raster tile, 256 or 512. A 256-pixel tile at zoom
+    /// z + 1 holds the same pixels as a quarter of a 512-pixel one at z, so
+    /// the default maximum zoom is one higher and every zoom is merged as the
+    /// larger tile one zoom out would be. [default: 512]
+    #[arg(long, value_name = "PIXELS")]
+    raster_size: Option<u32>,
+
     /// Write an index of the archives --raster produced to this path.
     ///
     /// Lists each forecast time with the archive holding it, and the encoding
@@ -194,6 +201,7 @@ fn main() -> Result<()> {
             buffer: cli.buffer,
             detail: cli.detail,
             raster: cli.raster,
+            raster_size: cli.raster_size,
             manifest: cli.manifest,
             skip_analysis: cli.skip_analysis,
             min_lead_time: cli.min_lead_time,

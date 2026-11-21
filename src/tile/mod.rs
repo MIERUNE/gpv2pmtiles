@@ -7,8 +7,8 @@ pub(crate) use detail::DetailSchedule;
 pub(crate) use reduce::Reducer;
 
 pub(crate) use raster::{
-    ColorEncoding, IMAGE_EXTENT as RASTER_IMAGE_EXTENT, RangeReport,
-    TILE_BUFFER as RASTER_TILE_BUFFER, TILE_EXTENT as RASTER_TILE_EXTENT,
+    ColorEncoding, RangeReport, RasterLayout, TILE_BUFFER as RASTER_TILE_BUFFER,
+    TILE_SIZES as RASTER_TILE_SIZES,
 };
 mod rect_union;
 
@@ -568,7 +568,7 @@ fn source_chunks(
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum TileOutput {
     Mvt(MvtLayout),
-    Raster(ColorEncoding),
+    Raster(RasterLayout),
 }
 
 /// The coordinate space of an MVT tile.
@@ -664,9 +664,11 @@ pub(crate) fn make_layer(
             ),
             layout.extent,
         ),
-        TileOutput::Raster(_) => {
-            detail::aggregation_scale(maximum_detail_zoom, z, detail::DEFAULT_DETAIL)
-        }
+        // A smaller tile reaches the same pixels a zoom later, and is merged
+        // as the larger one is there; see `RasterLayout::zoom_offset`.
+        TileOutput::Raster(layout) => (i32::from(maximum_detail_zoom) - i32::from(z)
+            + i32::from(layout.zoom_offset()))
+        .max(0) as u8,
     };
     let aggregation_width = 1u32 << aggregation_scale;
     let aggregation_mask = !(aggregation_width - 1);
@@ -848,12 +850,12 @@ pub(crate) fn make_layer(
             &points,
             &band_scales,
         ),
-        TileOutput::Raster(encoding) => raster::render_raster_tile(
+        TileOutput::Raster(layout) => raster::render_raster_tile(
             &product.spec,
             tile_context.zxy,
             &points,
             &band_scales,
-            encoding,
+            layout,
         ),
     }
 }
@@ -1043,10 +1045,10 @@ mod tests {
                         * n) as u32;
                     for output in [
                         TileOutput::Mvt(MvtLayout::default()),
-                        TileOutput::Raster(ColorEncoding::Scalar24 {
+                        TileOutput::Raster(RasterLayout::new(ColorEncoding::Scalar24 {
                             base: 0.0,
                             interval: 1.0,
-                        }),
+                        })),
                     ] {
                         let chunks = source_chunks(&product, (z, x, y), output);
                         let square = ChunkSquare::read_by(base_z, (z, x, y), output);
@@ -1063,6 +1065,86 @@ mod tests {
                                 "{reducer} fill {fill:?} z{z} scale {scale} {output:?}"
                             );
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    fn decode_png(png: &[u8]) -> (u32, Vec<u8>) {
+        let decoder = ::png::Decoder::new(std::io::Cursor::new(png));
+        let mut reader = decoder.read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!(info.width, info.height);
+        (info.width, pixels)
+    }
+
+    /// A 256-pixel tile one zoom deeper holds the pixels of a quarter of a
+    /// 512-pixel tile, margin included, whatever the cells are merged by.
+    #[test]
+    fn a_small_raster_tile_is_a_quarter_of_a_large_one() {
+        let mut product = mixed_product();
+        let (lng, lat): (f64, f64) = (118.0 + 3300.0 / 320.0, 20.0 + 2300.0 / 480.0);
+        let encoding = ColorEncoding::Scalar16 {
+            min: -20.0,
+            max: 60.0,
+        };
+        for reducer in ["max", "p95"] {
+            product.spec.reducer = reducer.parse().unwrap();
+            product.spec.fill = vec![(reducer != "max").then_some(0)];
+            // Merged into blocks, and cell for cell.
+            for z in [6u8, 9] {
+                let n = f64::from(1u32 << z);
+                let x = ((lng + 180.0) / 360.0 * n) as u32;
+                let y = ((1.0
+                    - (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln()
+                        / std::f64::consts::PI)
+                    / 2.0
+                    * n) as u32;
+                let large = make_layer(
+                    &TileContext::new((z, x, y)),
+                    &product,
+                    "layer",
+                    TileOutput::Raster(RasterLayout::new(encoding)),
+                )
+                .unwrap()
+                .unwrap();
+                let (large_side, large) = decode_png(&large);
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let small = make_layer(
+                        &TileContext::new((z + 1, 2 * x + dx, 2 * y + dy)),
+                        &product,
+                        "layer",
+                        TileOutput::Raster(RasterLayout {
+                            encoding,
+                            size: 256,
+                        }),
+                    )
+                    .unwrap();
+                    let window = |row: usize| {
+                        let begin = ((row + 256 * dy as usize) * 514 + 256 * dx as usize) * 4;
+                        &large[begin..begin + 258 * 4]
+                    };
+                    let Some(small) = small else {
+                        // An empty quarter: nothing of it may be on the grid.
+                        let off_grid = encoding.off_grid()[2];
+                        for row in 0..258usize {
+                            assert!(
+                                window(row).chunks(4).all(|pixel| pixel[2] == off_grid),
+                                "{reducer} z{z} quarter ({dx},{dy}) is empty but row {row} is not"
+                            );
+                        }
+                        continue;
+                    };
+                    let (small_side, small) = decode_png(&small);
+                    assert_eq!((large_side, small_side), (514, 258));
+                    for row in 0..258usize {
+                        assert_eq!(
+                            &small[row * 258 * 4..(row + 1) * 258 * 4],
+                            window(row),
+                            "{reducer} z{z} quarter ({dx},{dy}) row {row}"
+                        );
                     }
                 }
             }

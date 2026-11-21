@@ -18,8 +18,8 @@ use crate::{
     model::PreparedProduct,
     prepare, quantize,
     tile::{
-        ColorEncoding, DetailSchedule, MvtLayout, Reducer, TileContext, TileOutput, Zxy,
-        make_layer, zxy_to_chunk_id_range,
+        ColorEncoding, DetailSchedule, MvtLayout, RASTER_TILE_SIZES, RasterLayout, Reducer,
+        TileContext, TileOutput, Zxy, make_layer, zxy_to_chunk_id_range,
     },
 };
 
@@ -56,6 +56,8 @@ pub struct ConvertOptions {
     pub detail: Option<String>,
     /// Emit RGBA raster tiles with this colour encoding instead of MVT.
     pub raster: Option<String>,
+    /// Pixels across a raster tile, 256 or 512. Defaults to 512.
+    pub raster_size: Option<u32>,
     /// Write an index of the raster archives to this path.
     pub manifest: Option<PathBuf>,
     /// Drop products whose generating process is an analysis rather than a forecast.
@@ -83,6 +85,7 @@ impl Default for ConvertOptions {
             buffer: None,
             detail: None,
             raster: None,
+            raster_size: None,
             manifest: None,
             skip_analysis: false,
             min_lead_time: None,
@@ -132,6 +135,12 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
         options.omit_zero,
     )?;
     apply_aggregation(&mut products, options.aggregation.as_deref(), &options.fill)?;
+    let output_format = output_format(&products, options)?;
+    // A smaller raster tile needs one more zoom to reach the same pixels.
+    let zoom_offset = match output_format {
+        TileOutput::Raster(layout) => layout.zoom_offset(),
+        TileOutput::Mvt(_) => 0,
+    };
     let max_zoom = options.max_zoom.unwrap_or_else(|| {
         products
             .iter()
@@ -139,6 +148,7 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
                 (product.spec.grid_spec.lat_denom * 360.0 * 2.0 / 512.0)
                     .log2()
                     .round() as u8
+                    + zoom_offset
             })
             .max()
             .unwrap_or(options.min_zoom)
@@ -148,32 +158,6 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
         "minimum zoom {} exceeds maximum zoom {max_zoom}",
         options.min_zoom
     );
-
-    let output_format = match &options.raster {
-        Some(spec) => {
-            let encoding = spec.parse::<ColorEncoding>()?;
-            encoding.check_bands(
-                &products[0]
-                    .spec
-                    .band_specs
-                    .iter()
-                    .map(|band| band.name.clone())
-                    .collect::<Vec<_>>(),
-            )?;
-            TileOutput::Raster(encoding)
-        }
-        None => {
-            let default = MvtLayout::default();
-            TileOutput::Mvt(MvtLayout {
-                extent: options.extent.unwrap_or(default.extent),
-                buffer: options.buffer.unwrap_or(default.buffer),
-                detail: match &options.detail {
-                    Some(spec) => spec.parse::<DetailSchedule>()?,
-                    None => default.detail,
-                },
-            })
-        }
-    };
 
     match output_format {
         TileOutput::Mvt(_) => {
@@ -358,14 +342,14 @@ fn write_manifest(
             });
             // The extremes belong to one forecast time rather than to the set:
             // a later hour can hold a jet the first one did not.
-            if let (Some(entry), TileOutput::Raster(encoding)) =
+            if let (Some(entry), TileOutput::Raster(layout)) =
                 (entry.as_object_mut(), output_format)
             {
                 entry.insert(
                     "source_range".into(),
                     metadata::range_report(
-                        &crate::tile::inspect_raster_range(product, encoding),
-                        encoding,
+                        &crate::tile::inspect_raster_range(product, layout.encoding),
+                        layout.encoding,
                     ),
                 );
             }
@@ -378,7 +362,7 @@ fn write_manifest(
         // two times sets up its decode and its texture coordinates before it
         // opens any archive, and having to open one to find the rest is exactly
         // what the manifest is for avoiding.
-        TileOutput::Raster(encoding) => metadata::raster_encoding(products.first(), encoding),
+        TileOutput::Raster(layout) => metadata::raster_encoding(products.first(), layout),
         TileOutput::Mvt(_) => serde_json::Value::Null,
     };
     let manifest = serde_json::json!({
@@ -472,13 +456,13 @@ fn write_archive(
     // Measured over the source once, before any tile is written: saturation is
     // invisible in the output, so it has to be reported from the input.
     let range = match output_format {
-        TileOutput::Raster(encoding) => products.first().map(|product| {
-            let report = crate::tile::inspect_raster_range(product, encoding);
+        TileOutput::Raster(layout) => products.first().map(|product| {
+            let report = crate::tile::inspect_raster_range(product, layout.encoding);
             if report.is_clipping() {
                 let extremes = report
                     .extremes
                     .iter()
-                    .take(encoding.bands())
+                    .take(layout.encoding.bands())
                     .flatten()
                     .map(|(low, high)| format!("{low:.3}..{high:.3}"))
                     .collect::<Vec<_>>()
@@ -672,6 +656,16 @@ fn validate_options(options: &ConvertOptions) -> Result<()> {
             || (options.extent.is_none() && options.buffer.is_none() && options.detail.is_none()),
         "--extent, --buffer and --detail apply to MVT output, not to --raster"
     );
+    if let Some(size) = options.raster_size {
+        ensure!(
+            options.raster.is_some(),
+            "--raster-size sets the size of the tiles --raster writes, so it needs --raster as well"
+        );
+        ensure!(
+            RASTER_TILE_SIZES.contains(&size),
+            "--raster-size must be one of {RASTER_TILE_SIZES:?}"
+        );
+    }
     ensure!(
         options.manifest.is_none() || options.raster.is_some(),
         "--manifest indexes the archives --raster produces, so it needs --raster as well"
@@ -689,6 +683,40 @@ fn validate_options(options: &ConvertOptions) -> Result<()> {
     );
     quantize::validate_fill_syntax(&options.fill)?;
     Ok(())
+}
+
+/// What the tiles are written as: raster images when `--raster` is given,
+/// MVT otherwise.
+fn output_format(products: &[PreparedProduct], options: &ConvertOptions) -> Result<TileOutput> {
+    Ok(match &options.raster {
+        Some(spec) => {
+            let encoding = spec.parse::<ColorEncoding>()?;
+            encoding.check_bands(
+                &products[0]
+                    .spec
+                    .band_specs
+                    .iter()
+                    .map(|band| band.name.clone())
+                    .collect::<Vec<_>>(),
+            )?;
+            let mut layout = RasterLayout::new(encoding);
+            if let Some(size) = options.raster_size {
+                layout.size = size;
+            }
+            TileOutput::Raster(layout)
+        }
+        None => {
+            let default = MvtLayout::default();
+            TileOutput::Mvt(MvtLayout {
+                extent: options.extent.unwrap_or(default.extent),
+                buffer: options.buffer.unwrap_or(default.buffer),
+                detail: match &options.detail {
+                    Some(spec) => spec.parse::<DetailSchedule>()?,
+                    None => default.detail,
+                },
+            })
+        }
+    })
 }
 
 /// Chooses how each product's cells are combined, and resolves the fill
@@ -1282,7 +1310,10 @@ mod tests {
             metadata::MetadataOptions {
                 min_zoom: 0,
                 max_zoom: 0,
-                output: TileOutput::Raster(ColorEncoding::Scalar16 { min: 0.0, max: 1.0 }),
+                output: TileOutput::Raster(RasterLayout::new(ColorEncoding::Scalar16 {
+                    min: 0.0,
+                    max: 1.0,
+                })),
                 sequence: None,
                 range: None,
             },
