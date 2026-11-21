@@ -18,6 +18,7 @@ use fast_hilbert::xy2h;
 use crate::{
     geo::lat_to_web_mercator_y,
     model::{Band, BaseTile, CompactOptI32, PreparedProduct, TilesetSpec},
+    tile::Reducer,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -25,6 +26,7 @@ struct TilePoint {
     x: u16,
     y: u16,
     point_power: u8,
+    home: (i8, i8),
     values: [CompactOptI32; 4],
 }
 
@@ -72,7 +74,7 @@ fn read_messages<R: Read>(
     Ok(message_reader)
 }
 
-fn prepare_product(
+pub(crate) fn prepare_product(
     product_id: GpvProductIdentifier,
     mut product_data: ProductData,
 ) -> PreparedProduct {
@@ -164,12 +166,31 @@ fn prepare_product(
                 CompactOptI32::new(Some(point_band.value));
         }
 
+        // The chunk holding the cell's centre is the one whose copy counts
+        // when a tile reads several; see `BaseTile::point_homes`. The centre
+        // lies inside the margin the copies cover, so it is one of them.
+        let chunks_across = 1i64 << base_z;
+        let home_x = (((mx1 + mx2) / 2.0) * chunks_across as f64).floor() as i64;
+        let home_y = ((((my1 + my2) / 2.0) * chunks_across as f64).floor() as i64)
+            .clamp(0, chunks_across - 1);
         for x in x1..=x2 {
+            let offset_x = (home_x - i64::from(x)).rem_euclid(chunks_across);
+            // The shorter way round, so a cell on the antimeridian points
+            // across it rather than all the way back.
+            let offset_x = if offset_x > chunks_across / 2 {
+                offset_x - chunks_across
+            } else {
+                offset_x
+            };
             let x = x.rem_euclid(1 << base_z);
             for y in y1..=y2 {
                 if !(0..1 << base_z).contains(&y) {
                     continue;
                 }
+                tile_point.home = (
+                    i8::try_from(offset_x).expect("a cell spans only a few chunks"),
+                    i8::try_from(home_y - i64::from(y)).expect("a cell spans only a few chunks"),
+                );
                 tiles
                     .entry((x as u32, y as u32))
                     .or_default()
@@ -194,6 +215,7 @@ fn prepare_product(
             let tile = BaseTile {
                 point_positions: points.iter().map(|point| (point.x, point.y)).collect(),
                 point_powers: points.iter().map(|point| point.point_power).collect(),
+                point_homes: points.iter().map(|point| point.home).collect(),
                 bands,
             };
             (xy2h(tile_x, tile_y, base_z), tile)
@@ -205,7 +227,8 @@ fn prepare_product(
         name: product_id.path(),
         base_z,
         grid_spec: grid,
-        aggregation: product_id.aggregation(),
+        reducer: Reducer::Legacy(product_id.aggregation()),
+        fill: vec![None; product_data.band_specs.len()],
         quantize: vec![None; product_data.band_specs.len()],
         omit_zero: vec![None; product_data.band_specs.len()],
         omit_class: vec![None; product_data.band_specs.len()],

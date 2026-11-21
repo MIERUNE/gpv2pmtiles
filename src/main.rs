@@ -108,6 +108,30 @@ struct Cli {
     #[arg(long)]
     omit_zero: bool,
 
+    /// How the cells merged into a block at a low zoom are combined, instead
+    /// of the product's own aggregation: max, min, rough-avg or bit-or, as the
+    /// products recommend them, or a statistic that weighs each cell by its
+    /// area on the grid:
+    ///
+    ///   mean          the area-weighted mean, rounded half to even
+    ///   p<percent>    the smallest value covering at least that share of
+    ///                 the block, without interpolation, such as p95 or p99.5
+    ///
+    /// The weighted statistics count only the cells stored, unless --fill
+    /// says what the rest of the block holds.
+    #[arg(long, value_name = "METHOD", verbatim_doc_comment)]
+    aggregation: Option<String>,
+
+    /// Physical value counted over the part of a block no cell is stored for,
+    /// with --aggregation mean or p<percent>. Precipitation stores no cell
+    /// where nothing falls, so --fill 0 makes a block's statistic describe
+    /// the whole block rather than only where it rains. The value must be one
+    /// the band can hold exactly. Prefix with a band name when the product has
+    /// several bands, and repeat as needed. A block with no stored cell stays
+    /// empty.
+    #[arg(long, value_name = "VALUE")]
+    fill: Vec<String>,
+
     /// Write RGBA raster tiles instead of MVT, encoding band values into the
     /// colour channels so that a shader can read them back.
     ///
@@ -164,6 +188,8 @@ fn main() -> Result<()> {
             quantize: cli.quantize,
             omit_class: cli.omit_class,
             omit_zero: cli.omit_zero,
+            aggregation: cli.aggregation,
+            fill: cli.fill,
             extent: cli.extent,
             buffer: cli.buffer,
             detail: cli.detail,

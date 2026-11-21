@@ -18,8 +18,8 @@ use crate::{
     model::PreparedProduct,
     prepare, quantize,
     tile::{
-        ColorEncoding, DetailSchedule, MvtLayout, TileContext, TileOutput, Zxy, make_layer,
-        zxy_to_chunk_id_range,
+        ColorEncoding, DetailSchedule, MvtLayout, Reducer, TileContext, TileOutput, Zxy,
+        make_layer, zxy_to_chunk_id_range,
     },
 };
 
@@ -40,6 +40,12 @@ pub struct ConvertOptions {
     pub omit_class: Vec<String>,
     /// Leave out cells whose physical value is zero before quantization.
     pub omit_zero: bool,
+    /// How cells are combined into the blocks of a low zoom, overriding the
+    /// product's own aggregation; see [`crate::tile::Reducer`].
+    pub aggregation: Option<String>,
+    /// Physical value counted over the part of a block no cell is stored for,
+    /// as `[<band>=]<value>`. Needs a weighted `aggregation`.
+    pub fill: Vec<String>,
     /// MVT tile extent. Defaults to 4096.
     pub extent: Option<u32>,
     /// MVT geometry kept beyond each tile edge, in 1/256ths of the tile width.
@@ -71,6 +77,8 @@ impl Default for ConvertOptions {
             quantize: Vec::new(),
             omit_class: Vec::new(),
             omit_zero: false,
+            aggregation: None,
+            fill: Vec::new(),
             extent: None,
             buffer: None,
             detail: None,
@@ -123,6 +131,7 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
         &options.omit_class,
         options.omit_zero,
     )?;
+    apply_aggregation(&mut products, options.aggregation.as_deref(), &options.fill)?;
     let max_zoom = options.max_zoom.unwrap_or_else(|| {
         products
             .iter()
@@ -669,6 +678,38 @@ fn validate_options(options: &ConvertOptions) -> Result<()> {
     );
     quantize::validate_syntax(&options.quantize)?;
     quantize::validate_omit_class_syntax(&options.omit_class)?;
+    let reducer = options
+        .aggregation
+        .as_deref()
+        .map(str::parse::<Reducer>)
+        .transpose()?;
+    ensure!(
+        options.fill.is_empty() || reducer.is_some_and(Reducer::is_weighted),
+        "--fill counts the area no cell covers, which only --aggregation mean or p<percent> weigh"
+    );
+    quantize::validate_fill_syntax(&options.fill)?;
+    Ok(())
+}
+
+/// Chooses how each product's cells are combined, and resolves the fill
+/// against every forecast time's own band spec for the reason
+/// [`apply_quantization`] gives.
+fn apply_aggregation(
+    products: &mut [PreparedProduct],
+    aggregation: Option<&str>,
+    fill: &[String],
+) -> Result<()> {
+    let Some(aggregation) = aggregation else {
+        return Ok(());
+    };
+    let reducer = aggregation.parse::<Reducer>()?;
+    for (index, product) in products.iter_mut().enumerate() {
+        product.spec.reducer = reducer;
+        product.spec.fill = quantize::resolve_fill(fill, &product.spec.band_specs)?;
+        if index == 0 {
+            info!(aggregation = %reducer.name(), "combining cells");
+        }
+    }
     Ok(())
 }
 
@@ -1511,7 +1552,8 @@ mod tests {
                     lng_denom: 1.0,
                     lat_denom: 1.0,
                 },
-                aggregation: Aggregation::Max,
+                reducer: crate::tile::Reducer::Legacy(Aggregation::Max),
+                fill: Vec::new(),
                 band_specs: Vec::new(),
                 quantize: Vec::new(),
                 omit_zero: Vec::new(),

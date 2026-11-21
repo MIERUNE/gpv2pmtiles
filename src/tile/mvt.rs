@@ -285,7 +285,8 @@ mod tests {
             name: String::new(),
             base_z: 0,
             grid_spec: grid(),
-            aggregation: gpv_products::model::Aggregation::Max,
+            reducer: crate::tile::Reducer::Legacy(gpv_products::model::Aggregation::Max),
+            fill: vec![None],
             band_specs: vec![gpv_products::model::BandSpec {
                 name: "DN".to_string(),
                 ..Default::default()

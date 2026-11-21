@@ -1,9 +1,12 @@
 use gpv_products::{
-    model::{Aggregation, BandSpec, LngLatGrid},
+    model::{BandSpec, LngLatGrid},
     products::GpvProductIdentifier,
 };
 
-use crate::quantize::{BandOmit, BandQuantize};
+use crate::{
+    quantize::{BandOmit, BandQuantize},
+    tile::Reducer,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct CompactOptI32(i32);
@@ -75,6 +78,14 @@ pub(crate) struct Band {
 pub(crate) struct BaseTile {
     pub point_positions: Vec<(u16, u16)>,
     pub point_powers: Vec<u8>,
+    /// Where each point's own chunk lies, relative to this one.
+    ///
+    /// A cell is copied into every chunk its margin reaches, so a tile reading
+    /// several chunks sees a cell near their shared edge more than once. A
+    /// maximum does not care, but a weighted statistic would count the cell
+    /// twice. The chunk holding the cell's centre is its own; this records the
+    /// offset to it, so that exactly one copy can be kept.
+    pub point_homes: Vec<(i8, i8)>,
     pub bands: Vec<Band>,
 }
 
@@ -83,7 +94,12 @@ pub(crate) struct TilesetSpec {
     pub name: String,
     pub base_z: u8,
     pub grid_spec: LngLatGrid,
-    pub aggregation: Aggregation,
+    /// How the cells of a block are combined; the product's own aggregation
+    /// unless one was chosen.
+    pub reducer: Reducer,
+    /// Raw value counted over the part of a block no cell is stored for, per
+    /// band; `None` leaves that part out.
+    pub fill: Vec<Option<i32>>,
     pub band_specs: Vec<BandSpec>,
     /// Optional quantization per band, in `band_specs` order.
     pub quantize: Vec<Option<BandQuantize>>,

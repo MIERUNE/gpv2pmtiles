@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     model::PreparedProduct,
-    tile::{ColorEncoding, RangeReport, TileOutput},
+    tile::{ColorEncoding, RangeReport, Reducer, TileOutput},
 };
 
 #[derive(Serialize)]
@@ -231,7 +231,31 @@ pub(crate) fn generate_metadata(
         })
         .unwrap_or_default();
 
+    // Recorded only when chosen, so that a run that does not choose writes
+    // the same metadata as before.
+    let aggregation = products.first().and_then(|product| {
+        let spec = &product.spec;
+        (spec.reducer != Reducer::Legacy(product.product_id.aggregation())).then(|| {
+            let fill = spec
+                .band_specs
+                .iter()
+                .zip(&spec.fill)
+                .filter_map(|(band, fill)| {
+                    let raw = f64::from((*fill)?);
+                    let physical = (f64::from(band.reference_value)
+                        + raw * 2f64.powi(i32::from(band.binary_scale)))
+                        * 10f64.powi(-i32::from(band.decimal_scale));
+                    Some((band.name.clone(), json!(physical)))
+                })
+                .collect::<Map<String, Value>>();
+            json!({ "method": spec.reducer.name(), "fill": fill })
+        })
+    });
+
     let mut metadata = Map::new();
+    if let Some(aggregation) = aggregation {
+        metadata.insert("aggregation".into(), aggregation);
+    }
     metadata.insert("name".into(), json!(archive_name));
     metadata.insert("description".into(), json!(""));
     metadata.insert(

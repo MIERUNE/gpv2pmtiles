@@ -360,6 +360,48 @@ pub(crate) fn validate_omit_class_syntax(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Checks the syntax of `--fill` without needing the band specs.
+pub(crate) fn validate_fill_syntax(args: &[String]) -> Result<()> {
+    for arg in args {
+        let value = arg.split_once('=').map_or(arg.as_str(), |(_, value)| value);
+        parse_number(value)
+            .with_context(|| format!("--fill expects [<band>=]<value> but found {arg:?}"))?;
+    }
+    Ok(())
+}
+
+/// Resolves the physical `--fill` values into raw ones, per band.
+///
+/// A fill is counted as a stored value would be, so it has to be one: a value
+/// between two raw steps is refused rather than rounded, which would make the
+/// statistic describe a value nobody asked for.
+pub(crate) fn resolve_fill(args: &[String], band_specs: &[BandSpec]) -> Result<Vec<Option<i32>>> {
+    let mut resolved = vec![None; band_specs.len()];
+    for arg in args {
+        let (band_name, value) = split_band_prefix_for(arg, band_specs, "--fill")?;
+        let index = band_specs
+            .iter()
+            .position(|band| band.name == band_name)
+            .with_context(|| {
+                format!(
+                    "unknown band {band_name:?} in --fill; this product has {}",
+                    band_choices(band_specs)
+                )
+            })?;
+        ensure!(
+            resolved[index].is_none(),
+            "band {band_name:?} is given --fill more than once"
+        );
+        let physical = parse_number(value)?;
+        resolved[index] = Some(
+            physical_to_raw_exact(physical, &band_specs[index]).with_context(|| {
+                format!("--fill {physical} is not a value band {band_name:?} can hold exactly")
+            })?,
+        );
+    }
+    Ok(resolved)
+}
+
 /// Converts a physical value to its raw value, or `None` if it is not on the grid.
 fn physical_to_raw_exact(value: f64, band: &BandSpec) -> Option<i32> {
     let scaled = value * 10f64.powi(band.decimal_scale as i32);
