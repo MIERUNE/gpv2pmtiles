@@ -126,7 +126,15 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
         options.skip_analysis,
         options.min_lead_time,
     )?;
-    let mut products = prepare::prepare_products(products)?;
+    // Weighted statistics count every cell's area once, so they need input
+    // whose cells neither overlap nor disagree.
+    let strict = options
+        .aggregation
+        .as_deref()
+        .map(str::parse::<Reducer>)
+        .transpose()?
+        .is_some_and(Reducer::is_weighted);
+    let mut products = prepare::prepare_products(products, strict)?;
     let layer_names = build_layer_names(options, products.len())?;
 
     ensure_compatible_products(&products)?;
@@ -702,6 +710,12 @@ fn validate_options(options: &ConvertOptions) -> Result<()> {
     Ok(())
 }
 
+/// Whether a product's unstored cells read as zero.
+///
+/// Only where decoding drops a zero that means none: rain or snow that did not
+/// fall. Every other product stores its zeros, so what it leaves unstored is
+/// missing or outside its grid, and counting that as zero would drag a block
+/// at the edge of a model domain towards it.
 fn default_zero_fill(kind: gpv_products::products::GpvProductElement) -> bool {
     use gpv_products::products::GpvProductElement::*;
     matches!(
@@ -714,10 +728,6 @@ fn default_zero_fill(kind: gpv_products::products::GpvProductElement) -> bool {
             | Precipitaiton15h
             | SnowDepth
             | Snowfall
-            | GsmPrecipitation
-            | LfmPrecipitation
-            | MsmPrecipitation
-            | MepsPrecipitation
     )
 }
 
@@ -1688,6 +1698,10 @@ mod tests {
         for kind in [
             GpvProductElement::NowcastEchoTops,
             GpvProductElement::CwmWave,
+            // Model precipitation stores its zeros; what it leaves out is
+            // outside the domain, not dry.
+            GpvProductElement::MsmPrecipitation,
+            GpvProductElement::GsmPrecipitation,
         ] {
             products[0].product_id.kind = kind;
             apply_aggregation(&mut products, Some("mean"), &[], None).unwrap();
@@ -1701,6 +1715,35 @@ mod tests {
             ..Default::default()
         });
         assert!(apply_aggregation(&mut products, Some("p95"), &[], None).is_err());
+    }
+
+    /// The zero fill stands in for the zeros decoding dropped, so every
+    /// product it is the default for has to be one that drops them.
+    #[test]
+    fn zero_fill_defaults_only_where_decoding_drops_zero() {
+        use gpv_products::products::{GpvProductElement::*, GpvProductIdentifier};
+        for kind in [
+            BunpuPrecipitation,
+            BunpuSnowfall,
+            HiresNowcastIntensity,
+            HiresNowcastPrecip,
+            Precipitaiton,
+            Precipitaiton15h,
+            SnowDepth,
+            Snowfall,
+            GsmPrecipitation,
+            MsmPrecipitation,
+            LfmPrecipitation,
+            MepsPrecipitation,
+        ] {
+            let mut values = vec![0];
+            GpvProductIdentifier {
+                kind,
+                ..Default::default()
+            }
+            .translate_values(&mut values, 0);
+            assert_eq!(default_zero_fill(kind), values[0] == i32::MIN, "{kind:?}");
+        }
     }
 
     #[test]
@@ -1775,7 +1818,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let prepared = prepare::prepare_products(selected).unwrap();
+        let prepared = prepare::prepare_products(selected, false).unwrap();
 
         assert_eq!(prepared.len(), 1);
         assert_eq!(

@@ -58,10 +58,19 @@ pub(crate) fn read_products(
         .collect())
 }
 
-pub(crate) fn prepare_products(products: Vec<RawProduct>) -> Result<Vec<PreparedProduct>> {
+/// Prepares every product for tiling.
+///
+/// `strict` refuses source cells that overlap, sit off their own size, or
+/// disagree at one origin. A weighted statistic counts each cell's area, so
+/// such input would silently be counted twice; a maximum or a minimum gives the
+/// same answer either way, and input that converted before keeps converting.
+pub(crate) fn prepare_products(
+    products: Vec<RawProduct>,
+    strict: bool,
+) -> Result<Vec<PreparedProduct>> {
     products
         .into_par_iter()
-        .map(|product| prepare_product(product.product_id, product.data))
+        .map(|product| prepare_product(product.product_id, product.data, strict))
         .collect()
 }
 
@@ -77,6 +86,7 @@ fn read_messages<R: Read>(
 pub(crate) fn prepare_product(
     product_id: GpvProductIdentifier,
     mut product_data: ProductData,
+    strict: bool,
 ) -> Result<PreparedProduct> {
     let grid = product_data
         .grid
@@ -86,7 +96,7 @@ pub(crate) fn prepare_product(
         ensure!(point.point_power <= 16, "source cell power exceeds 16");
         let width = 1u32 << point.point_power;
         ensure!(
-            u32::from(point.x) % width == 0 && u32::from(point.y) % width == 0,
+            !strict || (u32::from(point.x) % width == 0 && u32::from(point.y) % width == 0),
             "source cell origin is not aligned to its size"
         );
         ensure!(
@@ -147,21 +157,21 @@ pub(crate) fn prepare_product(
         let area = 1u64 << (2 * point.point_power);
         let interval_start = u64::from(point.point_id) & !(area - 1);
         ensure!(
-            interval_start >= previous_end,
+            !strict || interval_start >= previous_end,
             "overlapping source cells at ({}, {})",
             point.x,
             point.y
         );
-        previous_end = interval_start + area;
+        previous_end = previous_end.max(interval_start + area);
         let mut band_values = [None; 4];
         for band in point_bands {
             ensure!(
-                band.point_power == point.point_power,
+                !strict || band.point_power == point.point_power,
                 "different source cell sizes at the same origin"
             );
             let previous = &mut band_values[usize::from(band.band_idx)];
             ensure!(
-                previous.is_none_or(|value| value == band.value),
+                !strict || previous.is_none_or(|value| value == band.value),
                 "conflicting source values at the same origin"
             );
             *previous = Some(band.value);
@@ -317,7 +327,7 @@ mod tests {
             grid: None,
         };
 
-        let prepared = prepare_product(product_id, product_data).unwrap();
+        let prepared = prepare_product(product_id, product_data, false).unwrap();
         let mut position_count = 0;
         for (_, tile) in &prepared.chunks {
             assert_eq!(tile.point_positions.len(), tile.point_powers.len());
@@ -357,7 +367,7 @@ mod tests {
             grid: Some(grid.clone()),
         };
 
-        let prepared = prepare_product(product_id, product_data).unwrap();
+        let prepared = prepare_product(product_id, product_data, false).unwrap();
 
         assert_eq!(prepared.spec.grid_spec, grid);
         assert_eq!(prepared.spec.base_z, 7);

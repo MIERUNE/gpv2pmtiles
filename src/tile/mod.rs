@@ -1004,7 +1004,7 @@ mod tests {
             generating_process: gpv_products::products::GeneratingProcessType::Forecast,
             ..Default::default()
         };
-        crate::prepare::prepare_product(product_id, product_data).unwrap()
+        crate::prepare::prepare_product(product_id, product_data, true).unwrap()
     }
 
     /// Each block reduced straight from the cells, counting each once.

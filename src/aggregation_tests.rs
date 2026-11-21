@@ -52,7 +52,7 @@ fn product(
     grid: LngLatGrid,
     method: Aggregation,
 ) -> PreparedProduct {
-    let mut product = prepare::prepare_products(vec![raw(cells, grid)])
+    let mut product = prepare::prepare_products(vec![raw(cells, grid)], true)
         .unwrap()
         .pop()
         .unwrap();
@@ -348,11 +348,25 @@ fn preparation_rejects_overlap_misalignment_and_conflicting_values() {
         vec![(0, 0, 17, 10)],
     ] {
         assert!(
-            prepare::prepare_products(vec![raw(&cells, grid())]).is_err(),
+            prepare::prepare_products(vec![raw(&cells, grid())], true).is_err(),
             "{cells:?}"
         );
     }
-    assert!(prepare::prepare_products(vec![raw(&[(0, 0, 1, 10), (2, 0, 0, 20)], grid())]).is_ok());
+    assert!(
+        prepare::prepare_products(vec![raw(&[(0, 0, 1, 10), (2, 0, 0, 20)], grid())], true).is_ok()
+    );
+    // A maximum gives the same answer however the cells lie, so input that
+    // converted before is not refused unless a weighted statistic needs it.
+    for cells in [
+        vec![(0, 0, 2, 10), (1, 1, 0, 20)],
+        vec![(1, 0, 1, 10)],
+        vec![(0, 0, 0, 10), (0, 0, 0, 20)],
+    ] {
+        assert!(
+            prepare::prepare_products(vec![raw(&cells, grid())], false).is_ok(),
+            "{cells:?}"
+        );
+    }
 }
 
 #[test]
@@ -411,7 +425,7 @@ fn source_overlap_validation_matches_rectangle_intersections() {
             }
         }
         assert_eq!(
-            prepare::prepare_products(vec![raw(&cells, grid())]).is_err(),
+            prepare::prepare_products(vec![raw(&cells, grid())], true).is_err(),
             overlapping,
             "{cells:?}"
         );
