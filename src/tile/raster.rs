@@ -840,13 +840,92 @@ pub(super) fn render_pixel_tile(
 ) -> Result<Option<Vec<u8>>> {
     let encoding = layout.encoding;
     let spec = &product.spec;
+    let bands = encoding.bands();
+    let Some(size) = aggregate_pixels(
+        product,
+        zxy,
+        chunks,
+        PixelLattice {
+            across: layout.size,
+            margin: TILE_BUFFER,
+            bands,
+            every_band: true,
+            output: super::TileOutput::Raster(layout),
+        },
+        work,
+    ) else {
+        return Ok(None);
+    };
+    let super::reduce::Workspace {
+        entries,
+        scratch,
+        pixels,
+        methods,
+        capacities,
+        touched,
+    } = work;
+
+    let mut rgba = encoding.off_grid().repeat(size * size);
+    let mut covered = false;
+    for &index in touched.iter() {
+        let index = index as usize;
+        let capacity = capacities[index];
+        let mut values = [0.0; 2];
+        let mut present = true;
+        for (b, value) in values.iter_mut().enumerate().take(bands) {
+            match pixels[index * bands + b]
+                .finish(methods[index], capacity, spec.fill[b], entries, scratch)
+                .and_then(|raw| finish_raw(raw, b, spec, &scales[b]))
+            {
+                Some(finished) => *value = finished,
+                None => present = false,
+            }
+        }
+        if present {
+            rgba[index * 4..index * 4 + 4].copy_from_slice(&encoding.encode(values));
+            covered = true;
+        }
+    }
+    if !covered {
+        return Ok(None);
+    }
+    Ok(Some(encode_png(&rgba, layout.image_size())?))
+}
+
+/// A tile's pixels: how many across it, how many more beyond each edge, and
+/// what each holds.
+pub(super) struct PixelLattice {
+    pub(super) across: u32,
+    pub(super) margin: u32,
+    pub(super) bands: usize,
+    /// Count a cell only where every band has a value, as the two components
+    /// of a vector field must; otherwise each band counts the cells it has.
+    pub(super) every_band: bool,
+    /// Which chunks the tile reads, for counting each cell once.
+    pub(super) output: super::TileOutput,
+}
+
+/// Gathers the cells under each pixel of a tile into `work`, and returns the
+/// side of the image, margin included, or `None` when no cell reaches it.
+///
+/// Coarse source cells count by how many basic cells of theirs fall in a
+/// pixel, without being expanded. These are grid-area statistics, not exact
+/// ground-area averages or exact polygon/pixel intersections.
+pub(super) fn aggregate_pixels(
+    product: &crate::model::PreparedProduct,
+    zxy: Zxy,
+    chunks: &[&[(u64, crate::model::BaseTile)]],
+    lattice: PixelLattice,
+    work: &mut super::reduce::Workspace,
+) -> Option<usize> {
+    let spec = &product.spec;
     let grid = &spec.grid_spec;
     let (z, tile_x, tile_y) = zxy;
-    let size = layout.image_size() as usize;
-    let world = f64::from(layout.size) * f64::from(1u32 << z);
-    let left = f64::from(tile_x) * f64::from(layout.size) - f64::from(TILE_BUFFER);
-    let top = f64::from(tile_y) * f64::from(layout.size) - f64::from(TILE_BUFFER);
-    let bands = encoding.bands();
+    let size = (lattice.across + 2 * lattice.margin) as usize;
+    let world = f64::from(lattice.across) * f64::from(1u32 << z);
+    let left = f64::from(tile_x) * f64::from(lattice.across) - f64::from(lattice.margin);
+    let top = f64::from(tile_y) * f64::from(lattice.across) - f64::from(lattice.margin);
+    let bands = lattice.bands;
     let method = spec.reducer;
 
     // Every range comes from the global pixel index, so adjacent tiles agree
@@ -896,12 +975,12 @@ pub(super) fn render_pixel_tile(
         })
         .collect::<Vec<_>>();
     if namings.is_empty() {
-        return Ok(None);
+        return None;
     }
     let row_origin = rows.last().map_or(0, |range| range.0);
     let row_end = rows.first().map_or(0, |range| range.1);
     if row_end <= row_origin {
-        return Ok(None);
+        return None;
     }
     let row_lookup = pixel_lookup(&rows, row_origin, (row_end - row_origin) as usize);
     let span = |ranges: &[(i64, i64)], pixel: u32| {
@@ -915,14 +994,14 @@ pub(super) fn render_pixel_tile(
     work.reset_pixels(size * size, bands);
     let super::reduce::Workspace {
         entries,
-        scratch,
+        scratch: _,
         pixels,
         methods,
         capacities,
         touched,
     } = work;
 
-    let square = super::ChunkSquare::read_by(spec.base_z, zxy, super::TileOutput::Raster(layout));
+    let square = super::ChunkSquare::read_by(spec.base_z, zxy, lattice.output);
     let mut read = chunks
         .iter()
         .flat_map(|chunk| chunk.iter())
@@ -935,8 +1014,12 @@ pub(super) fn render_pixel_tile(
             if !super::owns_cell(square, corner, tile, i) {
                 continue;
             }
-            // Both components must describe the same support.
-            if (0..bands).any(|b| tile.bands[b].values[i].get().is_none()) {
+            let present = |b: usize| tile.bands[b].values[i].get().is_some();
+            if if lattice.every_band {
+                !(0..bands).all(present)
+            } else {
+                !(0..bands).any(present)
+            } {
                 continue;
             }
             let width = 1i64 << tile.point_powers[i];
@@ -970,19 +1053,16 @@ pub(super) fn render_pixel_tile(
                         }
                         let index = row as usize * size + column as usize;
                         let states = &mut pixels[index * bands..(index + 1) * bands];
-                        if states[0].is_empty() {
+                        if capacities[index] == 0 {
                             touched.push(index as u32);
                             let capacity = span(&rows, row) * span(column_ranges, column);
                             capacities[index] = capacity;
                             methods[index] = super::reduce::effective_reducer(method, capacity);
                         }
                         for (b, state) in states.iter_mut().enumerate() {
-                            state.add(
-                                tile.bands[b].values[i].get().unwrap(),
-                                columns_in * rows_in,
-                                methods[index],
-                                entries,
-                            );
+                            if let Some(value) = tile.bands[b].values[i].get() {
+                                state.add(value, columns_in * rows_in, methods[index], entries);
+                            }
                         }
                     }
                 }
@@ -990,31 +1070,7 @@ pub(super) fn render_pixel_tile(
         }
     }
 
-    let mut rgba = encoding.off_grid().repeat(size * size);
-    let mut covered = false;
-    for &index in touched.iter() {
-        let index = index as usize;
-        let capacity = capacities[index];
-        let mut values = [0.0; 2];
-        let mut present = true;
-        for (b, value) in values.iter_mut().enumerate().take(bands) {
-            match pixels[index * bands + b]
-                .finish(methods[index], capacity, spec.fill[b], entries, scratch)
-                .and_then(|raw| finish_raw(raw, b, spec, &scales[b]))
-            {
-                Some(finished) => *value = finished,
-                None => present = false,
-            }
-        }
-        if present {
-            rgba[index * 4..index * 4 + 4].copy_from_slice(&encoding.encode(values));
-            covered = true;
-        }
-    }
-    if !covered {
-        return Ok(None);
-    }
-    Ok(Some(encode_png(&rgba, layout.image_size())?))
+    (!touched.is_empty()).then_some(size)
 }
 
 fn finish_raw(raw: f64, b: usize, spec: &TilesetSpec, scale: &BandScale<'_>) -> Option<f64> {

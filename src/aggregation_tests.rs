@@ -615,8 +615,7 @@ fn wrapped_constant_field_has_constant_mean() {
 
 #[test]
 fn wrapped_constant_field_percentile_does_not_panic() {
-    let product =
-        wrapped_product(1_000_000.0 / 9990.0, 26950..27110, "p95".parse().unwrap());
+    let product = wrapped_product(1_000_000.0 / 9990.0, 26950..27110, "p95".parse().unwrap());
     let _frame = raster(
         &product,
         (0, 0, 0),

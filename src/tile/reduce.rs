@@ -242,6 +242,7 @@ impl Workspace {
         for &index in &self.touched {
             let index = index as usize;
             self.pixels[index * stride..(index + 1) * stride].fill(Accumulator::default());
+            self.capacities[index] = 0;
         }
         self.touched.clear();
         if self.methods.len() != count || stride != bands {
@@ -288,11 +289,6 @@ impl Default for Accumulator {
     }
 }
 impl Accumulator {
-    /// Whether no cell has been counted yet.
-    pub(super) fn is_empty(&self) -> bool {
-        self.weight == 0
-    }
-
     pub(super) fn add(
         &mut self,
         value: i32,
