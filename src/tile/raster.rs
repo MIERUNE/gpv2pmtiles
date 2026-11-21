@@ -755,28 +755,76 @@ pub(super) fn render_raster_tile(
     Ok(Some(encode_png(&pixels, layout.image_size())?))
 }
 
-/// Use a product-wide latitude limit so neighbouring tiles choose the same
-/// resampling rule, including their shared margin. Both native axes must be
-/// finer than one pixel; other zooms retain native-grid interpolation.
+/// Whether a zoom aggregates the cells under each pixel rather than sampling
+/// the grid at pixel centres.
+///
+/// Wherever a cell is narrower or shorter than a pixel, sampling at centres
+/// skips some of the cells outright: a strip of heavy rain one cell high would
+/// come and go along the tile. So a zoom aggregates as soon as either axis is
+/// finer than a pixel anywhere in the product, which for latitude is where
+/// Mercator stretches it least. The decision is the product's, not the tile's,
+/// so that neighbouring tiles agree in the margin they share.
 pub(super) fn uses_pixel_aggregation(spec: &TilesetSpec, zxy: Zxy, tile_size: u32) -> bool {
     let across = f64::from(tile_size) * f64::from(1u32 << zxy.0);
     let grid = &spec.grid_spec;
-    let lat = spec.bounds[1]
-        .abs()
-        .max(spec.bounds[3].abs())
-        .min(85.0511287798066);
-    let dy = 0.5 / f64::from(grid.lat_denom);
-    let pixel_height = (crate::geo::lat_to_web_mercator_y(lat - dy)
-        - crate::geo::lat_to_web_mercator_y(lat + dy))
+    let cell_width = across / (360.0 * f64::from(grid.lng_denom));
+    let (south, north) = (spec.bounds[1], spec.bounds[3]);
+    let least_stretched = if south <= 0.0 && north >= 0.0 {
+        0.0
+    } else {
+        south.abs().min(north.abs())
+    }
+    .min(MAX_MERCATOR_LATITUDE);
+    let half = 0.5 / f64::from(grid.lat_denom);
+    let cell_height = (crate::geo::lat_to_web_mercator_y(least_stretched - half)
+        - crate::geo::lat_to_web_mercator_y(least_stretched + half))
     .abs()
         * across;
-    across / (360.0 * f64::from(grid.lng_denom)) <= 1.0 && pixel_height <= 1.0
+    cell_width < 1.0 || cell_height < 1.0
 }
 
-/// Assigns the centres of the virtual basic cells to globally anchored pixels.
-/// Coarse source cells are counted by intersections of integer ranges, without
-/// expanding them into basic cells. These are approximate grid-area statistics,
-/// not exact ground-area averages or exact polygon/pixel intersections.
+const MAX_MERCATOR_LATITUDE: f64 = 85.051_128_779_806_6;
+
+/// The basic cells a run of pixels along one axis covers, as `[low, high)` in
+/// grid coordinates, one entry per pixel.
+///
+/// A basic cell belongs to the pixel its centre falls in. A pixel narrower
+/// than a cell may hold no centre at all, and takes the cell under its own
+/// centre instead, so that every pixel over the grid has a value: aggregating
+/// where cells are smaller and sampling where they are larger.
+fn axis_ranges(edges: impl Iterator<Item = (f64, f64, f64)>) -> Vec<(i64, i64)> {
+    edges
+        .map(|(low, centre, high)| {
+            let (first, end) = (low.ceil() as i64, high.ceil() as i64);
+            if end > first {
+                (first, end)
+            } else {
+                let cell = (centre + 0.5).floor() as i64;
+                (cell, cell + 1)
+            }
+        })
+        .collect()
+}
+
+/// For each grid coordinate in `[origin, origin + len)`, the first and last
+/// pixel whose range holds it; `(u32::MAX, 0)` where none does.
+fn pixel_lookup(ranges: &[(i64, i64)], origin: i64, len: usize) -> Vec<(u32, u32)> {
+    let mut lookup = vec![(u32::MAX, 0); len];
+    for (pixel, &(first, end)) in ranges.iter().enumerate() {
+        for coordinate in first.max(origin)..end.min(origin + len as i64) {
+            let slot = &mut lookup[(coordinate - origin) as usize];
+            slot.0 = slot.0.min(pixel as u32);
+            slot.1 = slot.1.max(pixel as u32);
+        }
+    }
+    lookup
+}
+
+/// Renders a tile whose pixels each aggregate the basic cells they cover.
+///
+/// Coarse source cells count by how many basic cells of theirs fall in a
+/// pixel, without being expanded. These are grid-area statistics, not exact
+/// ground-area averages or exact polygon/pixel intersections.
 pub(super) fn render_pixel_tile(
     product: &crate::model::PreparedProduct,
     zxy: Zxy,
@@ -785,7 +833,6 @@ pub(super) fn render_pixel_tile(
     layout: RasterLayout,
     work: &mut super::reduce::Workspace,
 ) -> Result<Option<Vec<u8>>> {
-    use super::reduce::Accumulator;
     let encoding = layout.encoding;
     let spec = &product.spec;
     let grid = &spec.grid_spec;
@@ -796,31 +843,89 @@ pub(super) fn render_pixel_tile(
     let top = f64::from(tile_y) * f64::from(layout.size) - f64::from(TILE_BUFFER);
     let bands = encoding.bands();
     let method = spec.reducer;
-    let ceil = |value: f64| value.ceil() as i64;
-    let floor = |value: f64| value.floor() as i64;
-    // Every cut is computed from the global pixel index, so adjacent tiles
-    // use identical memberships, capacities, and bytes in the shared margin.
-    let xcuts: [Vec<i64>; 3] = std::array::from_fn(|shift| {
-        (0..=size)
-            .map(|c| {
-                let lon = (left + c as f64) / world * 360.0 - 180.0 + (shift as f64 - 1.0) * 360.0;
-                ceil((lon - grid.lng_0) * f64::from(grid.lng_denom))
+
+    // Every range comes from the global pixel index, so adjacent tiles agree
+    // on membership, capacity and bytes in the margin they share.
+    let lng_grid =
+        |pixel: f64| (pixel / world * 360.0 - 180.0 - grid.lng_0) * f64::from(grid.lng_denom);
+    let lat_grid = |pixel: f64| {
+        let latitude = web_mercator_to_lnglat(0.0, pixel / world).1;
+        (latitude - grid.lat_0) * f64::from(grid.lat_denom)
+    };
+    // Rows run south as they go down the image, so the grid runs backwards.
+    // Rows run south down the image while the grid runs north. A row holds
+    // the cells whose centres lie above its south edge and up to its north
+    // edge, the same half-open rule as the columns read the other way.
+    let rows = axis_ranges((0..size).map(|row| {
+        let row = top + row as f64;
+        let (north, centre, south) = (lat_grid(row), lat_grid(row + 0.5), lat_grid(row + 1.0));
+        (south.floor() + 1.0, centre, north.floor() + 1.0)
+    }));
+
+    // Longitude names the same meridian three ways, and a product framed in
+    // 0..360 meets a tile asking in -180..180 a turn away. Each naming that
+    // reaches the product's columns gets its own ranges, taken straight from
+    // the shifted coordinates so that a turn need not be whole cells.
+    let turn = 360.0 * f64::from(grid.lng_denom);
+    let product_columns = (
+        ((spec.bounds[0] - grid.lng_0) * f64::from(grid.lng_denom)).floor() as i64 - 1,
+        ((spec.bounds[2] - grid.lng_0) * f64::from(grid.lng_denom)).ceil() as i64 + 1,
+    );
+    let namings = [0.0, turn, -turn]
+        .into_iter()
+        .filter_map(|shift| {
+            let ranges = axis_ranges((0..size).map(|column| {
+                let column = left + column as f64;
+                (
+                    lng_grid(column) + shift,
+                    lng_grid(column + 0.5) + shift,
+                    lng_grid(column + 1.0) + shift,
+                )
+            }));
+            let first = ranges.first()?.0.max(product_columns.0);
+            let end = ranges.last()?.1.min(product_columns.1);
+            (end > first).then(|| {
+                let lookup = pixel_lookup(&ranges, first, (end - first) as usize);
+                (ranges, first, lookup)
             })
-            .collect()
-    });
-    let ycuts: Vec<i64> = (0..=size)
-        .map(|r| {
-            let lat = web_mercator_to_lnglat(0.0, (top + r as f64) / world).1;
-            floor((lat - grid.lat_0) * f64::from(grid.lat_denom)) + 1
         })
-        .collect();
-    struct Pixel {
-        states: [Accumulator; 2],
-        capacity: u64,
-        method: super::reduce::Reducer,
+        .collect::<Vec<_>>();
+    // Capacity is the unshifted naming's, which a shift of whole cells leaves
+    // as it is.
+    let columns = axis_ranges((0..size).map(|column| {
+        let column = left + column as f64;
+        (
+            lng_grid(column),
+            lng_grid(column + 0.5),
+            lng_grid(column + 1.0),
+        )
+    }));
+    if namings.is_empty() {
+        return Ok(None);
     }
-    let mut pixels: PointMap<usize, Pixel> = PointMap::default();
-    let overlap = |a: i64, b: i64, lo: i64, hi: i64| (b.min(hi) - a.max(lo)).max(0) as u64;
+    let row_origin = rows.last().map_or(0, |range| range.0);
+    let row_end = rows.first().map_or(0, |range| range.1);
+    if row_end <= row_origin {
+        return Ok(None);
+    }
+    let row_lookup = pixel_lookup(&rows, row_origin, (row_end - row_origin) as usize);
+    let span = |ranges: &[(i64, i64)], pixel: u32| {
+        let (first, end) = ranges[pixel as usize];
+        (end - first) as u64
+    };
+    let overlap = |cell: i64, width: i64, (first, end): (i64, i64)| {
+        (end.min(cell + width) - first.max(cell)).max(0) as u64
+    };
+
+    work.reset_pixels(size * size, bands);
+    let super::reduce::Workspace {
+        entries,
+        scratch,
+        pixels,
+        methods,
+        touched,
+    } = work;
+
     let square = super::ChunkSquare::read_by(spec.base_z, zxy, super::TileOutput::Raster(layout));
     let mut read = chunks
         .iter()
@@ -840,53 +945,46 @@ pub(super) fn render_pixel_tile(
             }
             let width = 1i64 << tile.point_powers[i];
             let (x, y) = (i64::from(x), i64::from(y));
-            let longitude = |x: i64| grid.lng_0 + x as f64 / f64::from(grid.lng_denom);
-            let latitude = |y: i64| grid.lat_0 + y as f64 / f64::from(grid.lat_denom);
-            let row0 = (crate::geo::lat_to_web_mercator_y(latitude(y + width - 1)) * world - top)
-                .floor() as i64
-                - 1;
-            let row1 =
-                (crate::geo::lat_to_web_mercator_y(latitude(y)) * world - top).floor() as i64 + 1;
-            let row0 = row0.max(0) as usize;
-            let row1 = row1.min(size as i64 - 1);
-            if row1 < row0 as i64 {
-                continue;
-            }
-            for (shift, cuts) in xcuts.iter().enumerate() {
-                let offset = (shift as f64 - 1.0) * world;
-                let col0 =
-                    (((longitude(x) + 180.0) / 360.0) * world - offset - left).floor() as i64 - 1;
-                let col1 = (((longitude(x + width - 1) + 180.0) / 360.0) * world - offset - left)
-                    .floor() as i64
-                    + 1;
-                let col0 = col0.max(0) as usize;
-                let col1 = col1.min(size as i64 - 1);
-                if col1 < col0 as i64 {
-                    continue;
+            // The rows and columns whose ranges reach the cell.
+            let reach = |lookup: &[(u32, u32)], origin: i64, low: i64| {
+                let mut found = (u32::MAX, 0u32);
+                for coordinate in low.max(origin)..(low + width).min(origin + lookup.len() as i64) {
+                    let (first, last) = lookup[(coordinate - origin) as usize];
+                    found = (found.0.min(first), found.1.max(last));
                 }
-                for row in row0..=row1 as usize {
-                    let ny = overlap(y, y + width, ycuts[row + 1], ycuts[row]);
-                    if ny == 0 {
+                (found.0 <= found.1).then_some(found)
+            };
+            let Some((row_first, row_last)) = reach(&row_lookup, row_origin, y) else {
+                continue;
+            };
+            for (column_ranges, column_origin, column_lookup) in &namings {
+                let Some((column_first, column_last)) = reach(column_lookup, *column_origin, x)
+                else {
+                    continue;
+                };
+                for row in row_first..=row_last {
+                    let rows_in = overlap(y, width, rows[row as usize]);
+                    if rows_in == 0 {
                         continue;
                     }
-                    for col in col0..=col1 as usize {
-                        let nx = overlap(x, x + width, cuts[col], cuts[col + 1]);
-                        if nx == 0 {
+                    for column in column_first..=column_last {
+                        let columns_in = overlap(x, width, column_ranges[column as usize]);
+                        if columns_in == 0 {
                             continue;
                         }
-                        let capacity = ((cuts[col + 1] - cuts[col]).max(0) as u64)
-                            * ((ycuts[row] - ycuts[row + 1]).max(0) as u64);
-                        let pixel = pixels.entry(row * size + col).or_insert_with(|| Pixel {
-                            states: std::array::from_fn(|_| Accumulator::default()),
-                            capacity,
-                            method: super::reduce::effective_reducer(method, capacity),
-                        });
-                        for b in 0..bands {
-                            pixel.states[b].add(
+                        let index = row as usize * size + column as usize;
+                        let states = &mut pixels[index * bands..(index + 1) * bands];
+                        if states[0].is_empty() {
+                            touched.push(index as u32);
+                            let capacity = span(&rows, row) * span(&columns, column);
+                            methods[index] = super::reduce::effective_reducer(method, capacity);
+                        }
+                        for (b, state) in states.iter_mut().enumerate() {
+                            state.add(
                                 tile.bands[b].values[i].get().unwrap(),
-                                nx * ny,
-                                pixel.method,
-                                work,
+                                columns_in * rows_in,
+                                methods[index],
+                                entries,
                             );
                         }
                     }
@@ -894,19 +992,22 @@ pub(super) fn render_pixel_tile(
             }
         }
     }
+
     let mut rgba = encoding.off_grid().repeat(size * size);
     let mut covered = false;
-    for (index, pixel) in pixels {
+    for &index in touched.iter() {
+        let index = index as usize;
+        let (row, column) = ((index / size) as u32, (index % size) as u32);
+        let capacity = span(&rows, row) * span(&columns, column);
         let mut values = [0.0; 2];
         let mut present = true;
-        for b in 0..bands {
-            let value = pixel.states[b]
-                .finish(pixel.method, pixel.capacity, spec.fill[b], work)
-                .and_then(|raw| finish_raw(raw, b, spec, &scales[b]));
-            if let Some(value) = value {
-                values[b] = value;
-            } else {
-                present = false;
+        for (b, value) in values.iter_mut().enumerate().take(bands) {
+            match pixels[index * bands + b]
+                .finish(methods[index], capacity, spec.fill[b], entries, scratch)
+                .and_then(|raw| finish_raw(raw, b, spec, &scales[b]))
+            {
+                Some(finished) => *value = finished,
+                None => present = false,
             }
         }
         if present {

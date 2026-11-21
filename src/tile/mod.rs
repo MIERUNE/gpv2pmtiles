@@ -1186,6 +1186,115 @@ mod tests {
         }
     }
 
+    /// Where cells are wider than a pixel but shorter than one, a strip of
+    /// heavy rain one cell high has to show in every column it crosses.
+    /// Sampling at pixel centres skipped the rows no centre fell in.
+    #[test]
+    fn a_strip_shorter_than_a_pixel_survives_at_the_zoom_cells_turn_wider() {
+        use gpv_products::{
+            model::{BandSpec, LngLatGrid},
+            products::{
+                GeneratingProcessType, GpvProductElement, GpvProductIdentifier, PointValue,
+                ProductData,
+            },
+        };
+        let grid = LngLatGrid {
+            lng_0: 118.0,
+            lat_0: 20.0,
+            lng_denom: 320.0,
+            lat_denom: 480.0,
+        };
+        let strip = 2200u16;
+        let mut points = Vec::new();
+        for y in 2000..2400u16 {
+            for x in 3000..3400u16 {
+                points.push(PointValue {
+                    x,
+                    y,
+                    point_id: 0,
+                    point_power: 0,
+                    band_idx: 0,
+                    value: if y == strip { 50 } else { 1 },
+                });
+            }
+        }
+        let product = crate::prepare::prepare_product(
+            GpvProductIdentifier {
+                kind: GpvProductElement::HiresNowcastIntensity,
+                generating_process: GeneratingProcessType::Forecast,
+                ..Default::default()
+            },
+            ProductData {
+                points,
+                band_specs: vec![BandSpec {
+                    name: "value".to_string(),
+                    ..Default::default()
+                }],
+                grid: Some(grid.clone()),
+            },
+            false,
+        )
+        .unwrap();
+
+        // At zoom 8 a cell is about 1.14 pixels wide and 0.84 high here.
+        let z = 8u8;
+        let layout = RasterLayout::new(ColorEncoding::Scalar16 {
+            min: 0.0,
+            max: 100.0,
+        });
+        assert!(raster::uses_pixel_aggregation(
+            &product.spec,
+            (z, 0, 0),
+            layout.size
+        ));
+        let n = f64::from(1u32 << z);
+        let (lng, lat): (f64, f64) = (118.0 + 3200.0 / 320.0, 20.0 + f64::from(strip) / 480.0);
+        let x = ((lng + 180.0) / 360.0 * n) as u32;
+        let y = ((1.0
+            - (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln() / std::f64::consts::PI)
+            / 2.0
+            * n) as u32;
+        let png = make_layer(
+            &TileContext::new((z, x, y)),
+            &product,
+            "layer",
+            TileOutput::Raster(layout),
+        )
+        .unwrap()
+        .unwrap();
+        let (side, pixels) = decode_png(&png);
+        let side = side as usize;
+        let code = |row: usize, column: usize| {
+            let pixel = &pixels[(row * side + column) * 4..(row * side + column) * 4 + 4];
+            (pixel[2] == 255).then_some(u16::from(pixel[0]) << 8 | u16::from(pixel[1]))
+        };
+        let mut counts = std::collections::HashMap::<u16, usize>::new();
+        for row in 0..side {
+            for column in 0..side {
+                if let Some(code) = code(row, column) {
+                    *counts.entry(code).or_default() += 1;
+                }
+            }
+        }
+        let background = counts
+            .into_iter()
+            .max_by_key(|&(_, count)| count)
+            .unwrap()
+            .0;
+        let mut columns_on_grid = 0;
+        for column in 0..side {
+            if (0..side).all(|row| code(row, column).is_none()) {
+                continue;
+            }
+            columns_on_grid += 1;
+            assert!(
+                (0..side).any(|row| code(row, column).is_some_and(|code| code > background)),
+                "the strip is missing from column {column}"
+            );
+        }
+        assert!(columns_on_grid > 100);
+    }
+
     fn value(value: i32) -> CompactOptI32 {
         CompactOptI32::new(Some(value))
     }

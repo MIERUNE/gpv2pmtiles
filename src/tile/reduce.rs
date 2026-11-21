@@ -206,7 +206,7 @@ impl BlockSamples {
 }
 
 #[derive(Clone, Copy)]
-struct Entry {
+pub(super) struct Entry {
     value: i32,
     next: u32,
     weight: u64,
@@ -217,8 +217,37 @@ const END: u32 = u32::MAX;
 /// Mean/extrema keep fixed-size state, and only percentiles retain samples.
 #[derive(Default)]
 pub(super) struct Workspace {
-    entries: Vec<Entry>,
-    scratch: BlockSamples,
+    pub(super) entries: Vec<Entry>,
+    pub(super) scratch: BlockSamples,
+    /// One state per band for every pixel of a raster image, band-major
+    /// within a pixel, kept between tiles so that an image allocates nothing.
+    /// Only `touched` pixels are anything but empty.
+    pub(super) pixels: Vec<Accumulator>,
+    /// The statistic each touched pixel uses; see [`effective_reducer`].
+    pub(super) methods: Vec<Reducer>,
+    pub(super) touched: Vec<u32>,
+}
+
+impl Workspace {
+    /// Makes room for an image of `count` pixels of `bands` bands, all empty.
+    pub(super) fn reset_pixels(&mut self, count: usize, bands: usize) {
+        let stride = if self.methods.is_empty() {
+            0
+        } else {
+            self.pixels.len() / self.methods.len()
+        };
+        for &index in &self.touched {
+            let index = index as usize;
+            self.pixels[index * stride..(index + 1) * stride].fill(Accumulator::default());
+        }
+        self.touched.clear();
+        if self.methods.len() != count || stride != bands {
+            self.pixels.clear();
+            self.pixels.resize(count * bands, Accumulator::default());
+            self.methods.clear();
+            self.methods.resize(count, Reducer::Mean);
+        }
+    }
 }
 
 thread_local! { static WORKSPACE:std::cell::RefCell<Workspace> = std::cell::RefCell::new(Workspace::default()); }
@@ -232,7 +261,7 @@ pub(super) fn with_workspace<T>(f: impl FnOnce(&mut Workspace) -> T) -> T {
     result
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(super) struct Accumulator {
     weight: u64,
     sum: i128,
@@ -254,7 +283,18 @@ impl Default for Accumulator {
     }
 }
 impl Accumulator {
-    pub(super) fn add(&mut self, value: i32, weight: u64, reducer: Reducer, work: &mut Workspace) {
+    /// Whether no cell has been counted yet.
+    pub(super) fn is_empty(&self) -> bool {
+        self.weight == 0
+    }
+
+    pub(super) fn add(
+        &mut self,
+        value: i32,
+        weight: u64,
+        reducer: Reducer,
+        entries: &mut Vec<Entry>,
+    ) {
         if weight == 0 {
             return;
         }
@@ -272,9 +312,9 @@ impl Accumulator {
             Reducer::Percentile(_) => {
                 self.min = self.min.min(value);
                 self.max = self.max.max(value);
-                let next = u32::try_from(work.entries.len()).expect("too many percentile samples");
+                let next = u32::try_from(entries.len()).expect("too many percentile samples");
                 assert_ne!(next, END);
-                work.entries.push(Entry {
+                entries.push(Entry {
                     value,
                     weight,
                     next: self.head,
@@ -288,17 +328,17 @@ impl Accumulator {
         reducer: Reducer,
         capacity: u64,
         fill: Option<i32>,
-        work: &mut Workspace,
+        entries: &[Entry],
+        scratch: &mut BlockSamples,
     ) -> Option<f64> {
         if self.weight == 0 {
             return None;
         }
-        assert!(
-            self.weight <= capacity,
-            "source cells overlap or exceed pixel capacity"
-        );
+        // Cells only exceed the capacity where they overlap, which input is
+        // refused for whenever a statistic weighs them; a maximum or a
+        // minimum is left to count them as they come.
         let missing = if fill.is_some() {
-            capacity - self.weight
+            capacity.saturating_sub(self.weight)
         } else {
             0
         };
@@ -332,14 +372,14 @@ impl Accumulator {
                 {
                     return Some(f64::from(fill));
                 }
-                work.scratch.clear();
+                scratch.clear();
                 let mut head = self.head;
                 while head != END {
-                    let entry = work.entries[head as usize];
-                    work.scratch.push(entry.value, entry.weight);
+                    let entry = entries[head as usize];
+                    scratch.push(entry.value, entry.weight);
                     head = entry.next;
                 }
-                return work.scratch.reduce_fractional(reducer, capacity, fill);
+                return scratch.reduce_fractional(reducer, capacity, fill);
             }
         })
     }
@@ -622,7 +662,7 @@ mod tests {
                     let mut work = Workspace::default();
                     let mut state = Accumulator::default();
                     for &(value, weight) in &samples {
-                        state.add(value, weight, method, &mut work);
+                        state.add(value, weight, method, &mut work.entries);
                     }
                     let mut oracle = samples.clone();
                     if let Some(fill) = fill {
@@ -641,7 +681,13 @@ mod tests {
                         .unwrap()
                         .0;
                     assert_eq!(
-                        state.finish(method, real + missing, fill, &mut work),
+                        state.finish(
+                            method,
+                            real + missing,
+                            fill,
+                            &work.entries,
+                            &mut work.scratch
+                        ),
                         Some(f64::from(expected)),
                         "case={case}, p={p}, fill={fill:?}"
                     );
