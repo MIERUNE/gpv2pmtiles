@@ -1157,17 +1157,28 @@ fn traverse_tile_pyramid(
     }
 
     let (z, x, y) = zxy;
-    if z >= min_zoom {
-        let tile_context = TileContext::new(zxy);
-        let layers = products
-            .par_iter()
-            .zip(layer_names.par_iter())
-            .map(|(product, layer_name)| make_layer(&tile_context, product, layer_name, output))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        if !layers.is_empty() {
+    // A tile and the pyramid below it are independent, so they run side by
+    // side. Waiting for the tile first left every thread but one idle while a
+    // low zoom gathered the cells of the whole grid, one zoom after another.
+    // Tiles are sorted before they are written, so the order they finish in
+    // does not reach the archive.
+    let (tile, children) = rayon::join(
+        || -> Result<()> {
+            if z < min_zoom {
+                return Ok(());
+            }
+            let tile_context = TileContext::new(zxy);
+            let layers = products
+                .par_iter()
+                .zip(layer_names.par_iter())
+                .map(|(product, layer_name)| make_layer(&tile_context, product, layer_name, output))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            if layers.is_empty() {
+                return Ok(());
+            }
             let tile = match output {
                 // MVT layers concatenate into one tile, and the archive stores
                 // them gzipped.
@@ -1190,26 +1201,30 @@ fn traverse_tile_pyramid(
             };
             sender
                 .send((zxy, tile))
-                .map_err(|_| anyhow::anyhow!("PMTiles writer stopped before tile generation"))?;
-        }
-    }
-
-    if z < max_zoom {
-        [(0, 0), (1, 0), (0, 1), (1, 1)]
-            .par_iter()
-            .try_for_each(|(dx, dy)| {
-                traverse_tile_pyramid(
-                    (z + 1, x * 2 + dx, y * 2 + dy),
-                    products,
-                    layer_names,
-                    min_zoom,
-                    max_zoom,
-                    output,
-                    sender,
-                )?;
-                Ok::<_, anyhow::Error>(())
-            })?;
-    }
+                .map_err(|_| anyhow::anyhow!("PMTiles writer stopped before tile generation"))
+        },
+        || -> Result<()> {
+            if z >= max_zoom {
+                return Ok(());
+            }
+            [(0, 0), (1, 0), (0, 1), (1, 1)]
+                .par_iter()
+                .try_for_each(|(dx, dy)| {
+                    traverse_tile_pyramid(
+                        (z + 1, x * 2 + dx, y * 2 + dy),
+                        products,
+                        layer_names,
+                        min_zoom,
+                        max_zoom,
+                        output,
+                        sender,
+                    )?;
+                    Ok::<_, anyhow::Error>(())
+                })
+        },
+    );
+    tile?;
+    children?;
     Ok(true)
 }
 
