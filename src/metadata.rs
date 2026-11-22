@@ -283,17 +283,11 @@ pub(crate) fn generate_metadata(
         })
         .unwrap_or_default();
 
-    // Recorded only when chosen, or when the lattice changes what the
-    // product's own statistic means, so that a run that does neither writes
-    // the same metadata as before.
-    let pixels = match output {
-        TileOutput::Raster(_) => true,
-        TileOutput::Mvt(layout) => layout.lattice,
-    };
+    // MVT and raster low zooms both aggregate into Mercator pixels.
     let aggregation = products.first().and_then(|product| {
         (product.spec.reducer != Reducer::Legacy(product.product_id.aggregation())
-            || matches!(output, TileOutput::Mvt(layout) if layout.lattice))
-        .then(|| aggregation_descriptor(product, pixels))
+            || matches!(output, TileOutput::Mvt(_)))
+        .then(|| aggregation_descriptor(product, true))
     });
 
     let mut metadata = Map::new();

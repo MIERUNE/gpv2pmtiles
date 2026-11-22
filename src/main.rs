@@ -51,27 +51,12 @@ struct Cli {
     #[arg(long, value_name = "PIXELS")]
     buffer: Option<u32>,
 
-    /// How coarsely MVT grid cells are merged at each zoom, as the log2 of the
-    /// resolution a merged block approaches: at 8 a block is about 1/256 of
-    /// the tile across, at 9 about 1/512. Give one value for every zoom, or
-    /// stops as <ZOOM>:<DETAIL>,... where each holds until the next, such as
-    /// 1:9,5:8,9:12. Blocks are a power of two cells across, so the size is
-    /// the nearest one to the request. Only values from 8 to 30 are accepted,
-    /// so blocks can be made finer than the default but not coarser. Raising
-    /// the detail stops short of blocks narrower than one unit of --extent,
-    /// which would round away with their value, so the extent limits how fine
-    /// a detail takes effect; at the default extent that is about detail 11.
-    /// The default blocks are kept as they are even when a small --extent
-    /// makes them narrower than a unit. [default: 8]
+    /// MVT pixels across a low-zoom tile, as log2: 8 means 256, 9 means 512.
+    /// Give one value for every zoom, or stops such as 1:9,5:8,9:12.
+    /// Accepts 7 through 12. Low zooms use one MVT unit per pixel; higher
+    /// zooms keep source cells at --extent. [default: 8]
     #[arg(long, value_name = "SPEC")]
     detail: Option<String>,
-
-    /// Experimental: merge the low zooms into a lattice of 2^detail pixels
-    /// across each tile, as --raster does, and write them at an extent of the
-    /// same size, one unit per pixel. Zooms whose cells are coarser than the
-    /// lattice keep the cells of the grid at --extent.
-    #[arg(long)]
-    lattice: bool,
 
     /// Drop products that are analyses rather than forecasts. Nowcast inputs
     /// lead with the observed field, valid at the reference time itself, which
@@ -116,25 +101,25 @@ struct Cli {
     #[arg(long)]
     omit_zero: bool,
 
-    /// How the cells merged into a block at a low zoom are combined, instead
+    /// How the cells merged into a pixel at a low zoom are combined, instead
     /// of the product's own aggregation: max, min, rough-avg or bit-or, as the
     /// products recommend them, or a statistic that weighs each cell by its
     /// area on the grid:
     ///
     ///   mean (avg)    the grid-area-weighted mean; vector raw values round half to even
     ///   p<percent>    the smallest value covering at least that share of
-    ///                 the block, without interpolation, such as p95 or p99.5
+    ///                 the pixel, without interpolation, such as p95 or p99.5
     ///
     /// Weighted statistics fill unstored cells with zero for precipitation
     /// and snow, and exclude them otherwise. Override with --missing or --fill.
     #[arg(long, value_name = "METHOD", verbatim_doc_comment)]
     aggregation: Option<String>,
 
-    /// Physical value counted over the part of a block no cell is stored for,
+    /// Physical value counted over the part of a pixel no cell is stored for,
     /// with --aggregation mean or p<percent>, overriding --missing for a band.
     /// Precipitation and snow already default to zero fill. The value must be one
     /// the band can hold exactly. Prefix with a band name when the product has
-    /// several bands, and repeat as needed. A block with no stored cell stays
+    /// several bands, and repeat as needed. A pixel with no stored cell stays
     /// empty.
     #[arg(long, value_name = "VALUE")]
     fill: Vec<String>,
@@ -213,7 +198,6 @@ fn main() -> Result<()> {
             extent: cli.extent,
             buffer: cli.buffer,
             detail: cli.detail,
-            lattice: cli.lattice,
             raster: cli.raster,
             raster_size: cli.raster_size,
             manifest: cli.manifest,
