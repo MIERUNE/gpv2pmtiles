@@ -1434,8 +1434,40 @@ mod tests {
     /// reads its neighbours, and is compared margin and all.
     #[test]
     fn the_pyramid_draws_the_tiles_the_cells_do() {
+        let mut compared = 0;
+        for (reducer, fill) in [
+            ("max", None),
+            ("max", Some(40)),
+            ("min", Some(3)),
+            ("mean", None),
+            ("mean", Some(0)),
+            ("rough-avg", None),
+            ("bit-or", Some(64)),
+        ] {
+            compared += pyramid_matches_cells(reducer, fill);
+        }
+        assert!(compared > 100, "{compared}");
+
         let mut product = mixed_product();
-        product.spec.reducer = "max".parse().unwrap();
+        product.spec.reducer = "p95".parse().unwrap();
+        crate::archive::build_pyramid(
+            &mut product,
+            0,
+            10,
+            TileOutput::Raster(RasterLayout::new(ColorEncoding::Scalar16 {
+                min: -20.0,
+                max: 60.0,
+            })),
+        );
+        assert!(product.pyramid.is_none());
+    }
+
+    /// Draws tiles round one spot with the pyramid and without, and returns
+    /// how many held anything.
+    fn pyramid_matches_cells(reducer: &str, fill: Option<i32>) -> usize {
+        let mut product = mixed_product();
+        product.spec.reducer = reducer.parse().unwrap();
+        product.spec.fill = vec![fill; product.spec.band_specs.len()];
         let (lng, lat): (f64, f64) = (118.0 + 3300.0 / 320.0, 20.0 + 2300.0 / 480.0);
         let outputs = [
             TileOutput::Mvt(MvtLayout {
@@ -1474,12 +1506,15 @@ mod tests {
                     let pyramid = product.pyramid.take();
                     let without = make_layer(&context, &product, "layer", output).unwrap();
                     product.pyramid = pyramid;
-                    assert_eq!(with, without, "{output:?} z{z} +({dx},{dy})");
+                    assert_eq!(
+                        with, without,
+                        "{reducer} {fill:?} {output:?} z{z} +({dx},{dy})"
+                    );
                     compared += usize::from(with.is_some());
                 }
             }
         }
-        assert!(compared > 20);
+        compared
     }
 
     fn value(value: i32) -> CompactOptI32 {

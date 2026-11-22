@@ -76,7 +76,7 @@ pub(super) fn render_lattice_layer(
         pyramid.window(level, corner, side, |row, column, raw| {
             let mut values = [CompactOptI32::NONE; 4];
             for (b, value) in values.iter_mut().enumerate().take(bands) {
-                *value = finished(b, raw[b].get().map(f64::from));
+                *value = finished(b, Some(raw[b]).filter(|raw| !raw.is_nan()));
             }
             if values.iter().any(|value| value.get().is_some()) {
                 cells.push((row, column, values));

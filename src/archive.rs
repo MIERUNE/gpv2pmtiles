@@ -235,15 +235,15 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
     }
 }
 
-/// Builds the pyramid of maxima a product's lattice zooms read, if it has any
-/// and takes its maximum; see [`crate::tile::Pyramid`].
+/// Builds the pyramid a product's lattice zooms read, if it has any and its
+/// statistic merges; see [`crate::tile::Pyramid`].
 pub(crate) fn build_pyramid(
     product: &mut PreparedProduct,
     min_zoom: u8,
     max_zoom: u8,
     output: TileOutput,
 ) {
-    if product.spec.reducer != Reducer::Legacy(gpv_products::model::Aggregation::Max) {
+    if !crate::tile::Pyramid::supports(product.spec.reducer) {
         return;
     }
     let levels = (min_zoom..=max_zoom)

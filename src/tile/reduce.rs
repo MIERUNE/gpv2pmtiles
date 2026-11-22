@@ -388,6 +388,78 @@ impl Accumulator {
     }
 }
 
+/// What a pyramid keeps of a pixel's cells: one number and the weight behind
+/// it, which merge into the pixel above without the cells.
+///
+/// The number is the maximum, the minimum, the bits or the weighted sum, as
+/// the statistic asks; a percentile cannot be kept this way. The weighted sum
+/// of `i32` values over fewer than `2^32` basic cells fits an `i64`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Partial {
+    value: i64,
+    weight: u64,
+}
+
+impl Partial {
+    /// Whether `reducer` reduces to a [`Partial`].
+    pub(crate) fn supports(reducer: Reducer) -> bool {
+        !matches!(reducer, Reducer::Percentile(_))
+    }
+
+    pub(crate) fn add(&mut self, value: i32, weight: u64, reducer: Reducer) {
+        self.merge(
+            Self {
+                value: match reducer {
+                    Reducer::Mean | Reducer::Legacy(Aggregation::RoughAvg) => {
+                        i64::from(value) * weight as i64
+                    }
+                    _ => i64::from(value),
+                },
+                weight,
+            },
+            reducer,
+        );
+    }
+
+    pub(crate) fn merge(&mut self, other: Self, reducer: Reducer) {
+        if other.weight == 0 {
+            return;
+        }
+        if self.weight == 0 {
+            *self = other;
+            return;
+        }
+        self.weight += other.weight;
+        self.value = match reducer {
+            Reducer::Mean | Reducer::Legacy(Aggregation::RoughAvg) => self.value + other.value,
+            Reducer::Legacy(Aggregation::Max) => self.value.max(other.value),
+            Reducer::Legacy(Aggregation::Min) => self.value.min(other.value),
+            Reducer::Legacy(Aggregation::BitOr) => self.value | other.value,
+            Reducer::Percentile(_) => unreachable!("a percentile does not merge"),
+        };
+    }
+
+    /// The pixel's value, exactly as [`Accumulator::finish`] gives it for the
+    /// same cells.
+    pub(crate) fn finish(self, reducer: Reducer, capacity: u64, fill: Option<i32>) -> Option<f64> {
+        let narrow = |value: i64| i32::try_from(value).expect("an extremum is one of the values");
+        let mut accumulator = Accumulator {
+            weight: self.weight,
+            ..Accumulator::default()
+        };
+        match reducer {
+            Reducer::Mean | Reducer::Legacy(Aggregation::RoughAvg) => {
+                accumulator.sum = i128::from(self.value)
+            }
+            Reducer::Legacy(Aggregation::Max) => accumulator.max = narrow(self.value),
+            Reducer::Legacy(Aggregation::Min) => accumulator.min = narrow(self.value),
+            Reducer::Legacy(Aggregation::BitOr) => accumulator.bits = narrow(self.value),
+            Reducer::Percentile(_) => unreachable!("a percentile does not merge"),
+        }
+        accumulator.finish(reducer, capacity, fill, &[], &mut BlockSamples::default())
+    }
+}
+
 pub(super) fn effective_reducer(reducer: Reducer, capacity: u64) -> Reducer {
     if let Reducer::Percentile(f) = reducer {
         if f.numerator == 0 {

@@ -63,7 +63,9 @@ fn level_descriptor(product: &PreparedProduct) -> Value {
     }
 }
 
-fn aggregation_descriptor(product: &PreparedProduct, raster: bool) -> Value {
+/// With `pixels`, the tiles aggregate into pixels, where an average is the
+/// weighted mean whichever was asked for.
+fn aggregation_descriptor(product: &PreparedProduct, pixels: bool) -> Value {
     let spec = &product.spec;
     let fill = spec
         .band_specs
@@ -77,7 +79,7 @@ fn aggregation_descriptor(product: &PreparedProduct, raster: bool) -> Value {
             Some((band.name.clone(), json!(physical)))
         })
         .collect::<Map<String, Value>>();
-    let method = if raster
+    let method = if pixels
         && matches!(
             spec.reducer,
             Reducer::Legacy(gpv_products::model::Aggregation::RoughAvg)
@@ -90,7 +92,7 @@ fn aggregation_descriptor(product: &PreparedProduct, raster: bool) -> Value {
         "method": method,
         "fill": fill,
         "missing_default": "exclude-unless-filled",
-        "weighting": if raster || spec.reducer.is_weighted() {
+        "weighting": if pixels || spec.reducer.is_weighted() {
             "basic-grid-cell-count"
         } else {
             "native-cell-count"
@@ -281,11 +283,17 @@ pub(crate) fn generate_metadata(
         })
         .unwrap_or_default();
 
-    // Recorded only when chosen, so that a run that does not choose writes
+    // Recorded only when chosen, or when the lattice changes what the
+    // product's own statistic means, so that a run that does neither writes
     // the same metadata as before.
+    let pixels = match output {
+        TileOutput::Raster(_) => true,
+        TileOutput::Mvt(layout) => layout.lattice,
+    };
     let aggregation = products.first().and_then(|product| {
-        (product.spec.reducer != Reducer::Legacy(product.product_id.aggregation()))
-            .then(|| aggregation_descriptor(product, matches!(output, TileOutput::Raster(_))))
+        (product.spec.reducer != Reducer::Legacy(product.product_id.aggregation())
+            || matches!(output, TileOutput::Mvt(layout) if layout.lattice))
+        .then(|| aggregation_descriptor(product, pixels))
     });
 
     let mut metadata = Map::new();

@@ -855,9 +855,9 @@ pub(super) fn render_pixel_tile(
         pyramid.window(level, corner, side, |row, column, raw| {
             let mut values = [0.0; 2];
             for (b, value) in values.iter_mut().enumerate().take(bands) {
-                match raw[b]
-                    .get()
-                    .and_then(|raw| finish_raw(f64::from(raw), b, spec, &scales[b]))
+                match Some(raw[b])
+                    .filter(|raw| !raw.is_nan())
+                    .and_then(|raw| finish_raw(raw, b, spec, &scales[b]))
                 {
                     Some(finished) => *value = finished,
                     None => return,
@@ -925,9 +925,8 @@ pub(super) fn render_pixel_tile(
 }
 
 /// The product's pyramid, when it can stand in for gathering a window's
-/// cells: the statistic is a maximum, the pyramid holds the level, and every
-/// pixel of the window holds a cell centre on both axes, so that its maximum
-/// nests.
+/// cells: the pyramid holds the level, and every pixel of the window holds a
+/// cell centre on both axes, so that its statistic nests.
 ///
 /// Which pixels hold a centre depends on the level and the pixel alone, so
 /// neighbouring tiles agree on the pixels they share whichever way they go.
@@ -938,9 +937,7 @@ pub(super) fn nested_pyramid(
     side: usize,
 ) -> Option<&super::Pyramid> {
     let pyramid = product.pyramid.as_ref()?;
-    if product.spec.reducer != super::Reducer::Legacy(gpv_products::model::Aggregation::Max)
-        || !pyramid.has_level(level)
-    {
+    if !pyramid.has_level(level) {
         return None;
     }
     let grid = &product.spec.grid_spec;

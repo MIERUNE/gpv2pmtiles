@@ -1,16 +1,17 @@
-//! A pyramid of maxima over the global pixel lattices, built once per product.
+//! A pyramid of pixel statistics over the global pixel lattices, built once
+//! per product.
 //!
 //! A zoom that aggregates into pixels gathers, at level `zoom + detail`, the
 //! basic cells whose centres fall in each pixel; see
 //! [`super::raster::aggregate_pixels`]. The pixel edges of one level are among
 //! those of the next, so a pixel's cells are exactly the cells of the four
-//! pixels under it, and its maximum is theirs. Gathering the cells once, at the
-//! finest level any zoom asks for, and halving from there gives every coarser
-//! level without reading a cell again.
+//! pixels under it. A maximum, a minimum, the bits or a weighted sum of the
+//! four, with their weights added, is that of the cells ([`Partial`]).
+//! Gathering the cells once, at the finest level any zoom asks for, and
+//! halving from there gives every coarser level without reading a cell again.
 //!
-//! Only maxima are kept. A mean would carry a sum and a weight just as well,
-//! but a percentile cannot be recovered from the percentiles below it, and
-//! the other statistics still gather from the cells.
+//! A percentile cannot be recovered from the percentiles below it, and still
+//! gathers from the cells.
 //!
 //! A pixel that holds no cell centre - where a cell is wider or taller than a
 //! pixel - takes the cell under its own centre instead, which does not nest.
@@ -22,37 +23,59 @@
 //! was mostly empty, while a sorted list of single pixels spent its time
 //! sorting; a block is found by a lookup and filled in place.
 
+//!
+//! The partial statistics live only while the next level is made from them;
+//! each level keeps the finished value of its pixels.
+
 use foldhash::HashMap;
 use rayon::prelude::*;
 
-use crate::{
-    geo::web_mercator_to_lnglat,
-    model::{CompactOptI32, PreparedProduct},
-};
+use gpv_products::model::LngLatGrid as GridSpec;
+
+use super::{Reducer, reduce::Partial};
+use crate::{geo::web_mercator_to_lnglat, model::PreparedProduct};
 
 /// Pixels across a block, as a power of two.
 const BLOCK_SHIFT: u32 = 6;
 const BLOCK: usize = 1 << BLOCK_SHIFT;
 const BLOCK_MASK: i64 = BLOCK as i64 - 1;
 
-/// One level: blocks of `BLOCK` × `BLOCK` pixels, each holding `bands`
-/// values per pixel row by row, found by their global block row and column.
-#[derive(Default)]
-struct Level {
+/// Blocks of `BLOCK` × `BLOCK` pixels, each holding `bands` values per pixel
+/// row by row, found by their global block row and column.
+struct Blocks<T> {
     index: HashMap<(i64, i64), usize>,
-    blocks: Vec<Vec<CompactOptI32>>,
+    blocks: Vec<((i64, i64), Vec<T>)>,
 }
 
-impl Level {
-    fn get(&self, key: (i64, i64)) -> Option<&[CompactOptI32]> {
-        self.index.get(&key).map(|&at| self.blocks[at].as_slice())
+impl<T> Default for Blocks<T> {
+    fn default() -> Self {
+        Self {
+            index: HashMap::default(),
+            blocks: Vec::new(),
+        }
+    }
+}
+
+impl<T> Blocks<T> {
+    fn get(&self, key: (i64, i64)) -> Option<&[T]> {
+        self.index.get(&key).map(|&at| self.blocks[at].1.as_slice())
+    }
+
+    fn from_blocks(blocks: Vec<((i64, i64), Vec<T>)>) -> Self {
+        let index = blocks
+            .iter()
+            .enumerate()
+            .map(|(at, (key, _))| (*key, at))
+            .collect();
+        Self { index, blocks }
     }
 }
 
 pub(crate) struct Pyramid {
-    /// Levels from `first` up; `levels[i]` is level `first + i`.
+    /// Levels from `first` up; `levels[i]` is level `first + i`. A pixel
+    /// holds its finished value per band, NaN where it has none.
     first: u8,
-    levels: Vec<Level>,
+    levels: Vec<Blocks<f64>>,
     bands: usize,
 }
 
@@ -74,6 +97,11 @@ impl std::fmt::Debug for Pyramid {
 }
 
 impl Pyramid {
+    /// Whether a pyramid can hold the statistic.
+    pub(crate) fn supports(reducer: Reducer) -> bool {
+        Partial::supports(reducer)
+    }
+
     /// Gathers the product's cells into level `finest` and halves down to
     /// `coarsest`.
     ///
@@ -85,11 +113,44 @@ impl Pyramid {
         finest: u8,
         every_band: bool,
     ) -> Self {
-        let bands = product.spec.band_specs.len();
-        let mut levels = vec![gather(product, finest, bands, every_band)];
-        for _ in coarsest..finest {
-            let next = halve(levels.last().expect("one level at least"), bands);
-            levels.push(next);
+        let spec = &product.spec;
+        let bands = spec.band_specs.len();
+        let reducer = spec.reducer;
+        let (max_x, max_y) = grid_extent(product);
+        let mut partials = gather(product, finest, (max_x, max_y), every_band);
+        let mut levels = Vec::new();
+        for level in (coarsest..=finest).rev() {
+            let columns = Axis::columns(&spec.grid_spec, level, max_x);
+            let rows = Axis::rows(&spec.grid_spec, level, max_y);
+            levels.push(Blocks::from_blocks(
+                partials
+                    .blocks
+                    .par_iter()
+                    .map(|&(key, ref block)| {
+                        let mut out = vec![f64::NAN; block.len()];
+                        for row in 0..BLOCK {
+                            let height = rows.span(key.0 * BLOCK as i64 + row as i64);
+                            for column in 0..BLOCK {
+                                let width = columns.span(key.1 * BLOCK as i64 + column as i64);
+                                let at = (row * BLOCK + column) * bands;
+                                for band in 0..bands {
+                                    if let Some(value) = block[at + band].finish(
+                                        reducer,
+                                        height * width,
+                                        spec.fill[band],
+                                    ) {
+                                        out[at + band] = value;
+                                    }
+                                }
+                            }
+                        }
+                        (key, out)
+                    })
+                    .collect(),
+            ));
+            if level > coarsest {
+                partials = halve(&partials, bands, reducer);
+            }
         }
         levels.reverse();
         Self {
@@ -105,14 +166,14 @@ impl Pyramid {
     }
 
     /// The pixels of a square window of `level` that hold a value, as
-    /// `(row, column, values)` relative to the window's corner, row by row.
-    /// Columns wrap round the world.
+    /// `(row, column, values)` relative to the window's corner, row by row,
+    /// with NaN for a band without one. Columns wrap round the world.
     pub(crate) fn window(
         &self,
         level: u8,
         (top, left): (i64, i64),
         side: usize,
-        mut visit: impl FnMut(usize, usize, &[CompactOptI32]),
+        mut visit: impl FnMut(usize, usize, &[f64]),
     ) {
         let blocks = &self.levels[usize::from(level - self.first)];
         let world = 1i64 << level;
@@ -134,7 +195,7 @@ impl Pyramid {
                     for offset in 0..run {
                         let at = (base + inner + offset) * bands;
                         let values = &block[at..at + bands];
-                        if values.iter().any(|value| value.get().is_some()) {
+                        if values.iter().any(|value| !value.is_nan()) {
                             visit(row, column + offset, values);
                         }
                     }
@@ -145,10 +206,8 @@ impl Pyramid {
     }
 }
 
-/// The maxima of level `level`, gathered from the cells.
-fn gather(product: &PreparedProduct, level: u8, bands: usize, every_band: bool) -> Level {
-    let grid = &product.spec.grid_spec;
-    let world = (1u64 << level) as f64;
+/// The basic columns and rows the product's cells reach.
+fn grid_extent(product: &PreparedProduct) -> (usize, usize) {
     let cells = || {
         product
             .chunks
@@ -163,43 +222,96 @@ fn gather(product: &PreparedProduct, level: u8, bands: usize, every_band: bool) 
         .map(|(&(_, y), &power)| usize::from(y) + (1 << power))
         .max()
         .unwrap_or(0);
+    (max_x, max_y)
+}
 
-    // Each basic cell belongs to the pixel its centre falls in. The rules are
-    // those of `aggregate_pixels`, evaluated over the whole world: a pixel
-    // edge `t` in grid units claims the cells from `ceil(t)` on for columns,
-    // and from `floor(t) + 1` on for rows, which run the other way.
-    let lng_grid =
-        |pixel: f64| (pixel / world * 360.0 - 180.0 - grid.lng_0) * f64::from(grid.lng_denom);
-    let turn = 360.0 * f64::from(grid.lng_denom);
-    let mut column_of = vec![i64::MIN; max_x];
-    for shift in [0.0, turn, -turn] {
-        let mut low = (lng_grid(0.0) + shift).ceil() as i64;
-        for column in 0..(1i64 << level) {
-            let high = (lng_grid(column as f64 + 1.0) + shift).ceil() as i64;
-            for x in low.max(0)..high.min(max_x as i64) {
-                column_of[x as usize] = column;
+/// One axis of a level: the pixel each basic column or row belongs to, and
+/// how many basic columns or rows each pixel spans - its share of a pixel's
+/// capacity, counted as [`super::raster::aggregate_pixels`] counts it.
+///
+/// Each basic cell belongs to the pixel its centre falls in. The rules are
+/// those of `aggregate_pixels`, evaluated over the whole world: a pixel edge
+/// `t` in grid units claims the cells from `ceil(t)` on for columns, and from
+/// `floor(t) + 1` on for rows, which run the other way.
+struct Axis {
+    owner: Vec<i64>,
+    span: Vec<u64>,
+}
+
+impl Axis {
+    fn span(&self, pixel: i64) -> u64 {
+        usize::try_from(pixel)
+            .ok()
+            .and_then(|pixel| self.span.get(pixel))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Longitude names the same meridian three ways; a pixel takes its span
+    /// from the naming that reaches the product's columns there, as a tile
+    /// does.
+    fn columns(grid: &GridSpec, level: u8, len: usize) -> Self {
+        let world = (1u64 << level) as f64;
+        let lng_grid =
+            |pixel: f64| (pixel / world * 360.0 - 180.0 - grid.lng_0) * f64::from(grid.lng_denom);
+        let turn = 360.0 * f64::from(grid.lng_denom);
+        let mut owner = vec![i64::MIN; len];
+        let mut span = vec![0; 1 << level];
+        for shift in [0.0, turn, -turn] {
+            let mut low = (lng_grid(0.0) + shift).ceil() as i64;
+            for column in 0..(1i64 << level) {
+                let high = (lng_grid(column as f64 + 1.0) + shift).ceil() as i64;
+                let reached = low.max(0)..high.min(len as i64);
+                if !reached.is_empty() {
+                    span[column as usize] = (high - low) as u64;
+                }
+                for x in reached {
+                    owner[x as usize] = column;
+                }
+                low = high;
             }
-            low = high;
         }
+        Self { owner, span }
     }
-    let lat_grid = |pixel: f64| {
-        let latitude = web_mercator_to_lnglat(0.0, pixel / world).1;
-        (latitude - grid.lat_0) * f64::from(grid.lat_denom)
-    };
-    let mut row_of = vec![i64::MIN; max_y];
-    let mut north = lat_grid(0.0).floor() as i64 + 1;
-    for row in 0..(1i64 << level) {
-        let south = lat_grid(row as f64 + 1.0).floor() as i64 + 1;
-        for y in south.max(0)..north.min(max_y as i64) {
-            row_of[y as usize] = row;
+
+    fn rows(grid: &GridSpec, level: u8, len: usize) -> Self {
+        let world = (1u64 << level) as f64;
+        let lat_grid = |pixel: f64| {
+            let latitude = web_mercator_to_lnglat(0.0, pixel / world).1;
+            (latitude - grid.lat_0) * f64::from(grid.lat_denom)
+        };
+        let mut owner = vec![i64::MIN; len];
+        let mut span = vec![0; 1 << level];
+        let mut north = lat_grid(0.0).floor() as i64 + 1;
+        for row in 0..(1i64 << level) {
+            let south = lat_grid(row as f64 + 1.0).floor() as i64 + 1;
+            span[row as usize] = (north - south).max(0) as u64;
+            for y in south.max(0)..north.min(len as i64) {
+                owner[y as usize] = row;
+            }
+            north = south;
         }
-        north = south;
+        Self { owner, span }
     }
+}
+
+/// The partial statistics of level `level`, gathered from the cells.
+fn gather(
+    product: &PreparedProduct,
+    level: u8,
+    (max_x, max_y): (usize, usize),
+    every_band: bool,
+) -> Blocks<Partial> {
+    let spec = &product.spec;
+    let bands = spec.band_specs.len();
+    let reducer = spec.reducer;
+    let column_of = Axis::columns(&spec.grid_spec, level, max_x).owner;
+    let row_of = Axis::rows(&spec.grid_spec, level, max_y).owner;
 
     // Every cell once: the copy in the chunk that holds its centre. The cells
     // of a chunk run in Hilbert order, so consecutive ones mostly share a
     // block, and the last one found is kept at hand.
-    let mut level = Level::default();
+    let mut level = Blocks::<Partial>::default();
     let mut last_key = (i64::MIN, i64::MIN);
     let mut last_block = 0;
     for (_, tile) in &product.chunks {
@@ -235,16 +347,15 @@ fn gather(product: &PreparedProduct, level: u8, bands: usize, every_band: bool) 
                         if last_block == next {
                             level
                                 .blocks
-                                .push(vec![CompactOptI32::NONE; BLOCK * BLOCK * bands]);
+                                .push((key, vec![Partial::default(); BLOCK * BLOCK * bands]));
                         }
                     }
-                    let block = &mut level.blocks[last_block];
+                    let block = &mut level.blocks[last_block].1;
                     let at = ((row & BLOCK_MASK) as usize * BLOCK + (column & BLOCK_MASK) as usize)
                         * bands;
                     for band in 0..bands {
-                        let value = tile.bands[band].values[index];
-                        if value > block[at + band] {
-                            block[at + band] = value;
+                        if let Some(value) = tile.bands[band].values[index].get() {
+                            block[at + band].add(value, 1, reducer);
                         }
                     }
                 }
@@ -254,9 +365,9 @@ fn gather(product: &PreparedProduct, level: u8, bands: usize, every_band: bool) 
     level
 }
 
-/// The level one coarser than `finer`: each pixel the maximum of the four
-/// under it. A block's four children fill one quadrant each.
-fn halve(finer: &Level, bands: usize) -> Level {
+/// The level one coarser than `finer`: each pixel merges the four under it.
+/// A block's four children fill one quadrant each.
+fn halve(finer: &Blocks<Partial>, bands: usize, reducer: Reducer) -> Blocks<Partial> {
     let mut parents = finer
         .index
         .keys()
@@ -264,37 +375,31 @@ fn halve(finer: &Level, bands: usize) -> Level {
         .collect::<Vec<_>>();
     parents.sort_unstable();
     parents.dedup();
-    parents
-        .into_par_iter()
-        .map(|parent| {
-            let mut out = vec![CompactOptI32::NONE; BLOCK * BLOCK * bands];
-            for (down, across) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
-                let Some(child) = finer.get((2 * parent.0 + down, 2 * parent.1 + across)) else {
-                    continue;
-                };
-                let (quadrant_row, quadrant_column) =
-                    (down as usize * BLOCK / 2, across as usize * BLOCK / 2);
-                for row in 0..BLOCK {
-                    let out_row = quadrant_row + row / 2;
-                    for column in 0..BLOCK {
-                        let from = (row * BLOCK + column) * bands;
-                        let to = (out_row * BLOCK + quadrant_column + column / 2) * bands;
-                        for band in 0..bands {
-                            if child[from + band] > out[to + band] {
-                                out[to + band] = child[from + band];
+    Blocks::from_blocks(
+        parents
+            .into_par_iter()
+            .map(|parent| {
+                let mut out = vec![Partial::default(); BLOCK * BLOCK * bands];
+                for (down, across) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                    let Some(child) = finer.get((2 * parent.0 + down, 2 * parent.1 + across))
+                    else {
+                        continue;
+                    };
+                    let (quadrant_row, quadrant_column) =
+                        (down as usize * BLOCK / 2, across as usize * BLOCK / 2);
+                    for row in 0..BLOCK {
+                        let out_row = quadrant_row + row / 2;
+                        for column in 0..BLOCK {
+                            let from = (row * BLOCK + column) * bands;
+                            let to = (out_row * BLOCK + quadrant_column + column / 2) * bands;
+                            for band in 0..bands {
+                                out[to + band].merge(child[from + band], reducer);
                             }
                         }
                     }
                 }
-            }
-            (parent, out)
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .enumerate()
-        .fold(Level::default(), |mut level, (at, (parent, out))| {
-            level.index.insert(parent, at);
-            level.blocks.push(out);
-            level
-        })
+                (parent, out)
+            })
+            .collect(),
+    )
 }
