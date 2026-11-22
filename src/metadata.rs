@@ -134,7 +134,7 @@ pub(crate) fn raster_encoding(product: Option<&PreparedProduct>, layout: RasterL
             "downsampling":"basic-cell-centre-aggregation",
             "weighting":"basic-grid-cell-count",
             "ground_area_weighted":false,
-            "downsampling_condition":"both-native-axes-finer-than-pixel-throughout-product",
+            "downsampling_condition":"either-native-axis-finer-than-pixel-somewhere-in-grid-frame",
             "upsampling":if product.spec.quantize.iter().any(Option::is_some) {"nearest"} else {"bilinear"},
             "source_interpretation_at_low_zoom":"constant-per-native-cell",
         }));
