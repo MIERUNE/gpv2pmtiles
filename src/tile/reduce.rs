@@ -1,16 +1,7 @@
-//! Area-weighted statistics for the blocks a low zoom merges cells into.
+//! Pixel statistics weighted by the basic grid cells each source cell spans.
 //!
-//! The aggregations a product recommends ([`Aggregation`]) treat every cell as
-//! one sample. That is enough for a maximum, but an average then counts a 1 km
-//! cell the same as a 250 m one, and a percentile has no notion of how much of
-//! a block a value covers. The statistics here weigh each cell by the base
-//! cells it spans, `4^power`, which is its share of the block's area on the
-//! grid.
-//!
-//! The part of a block no cell is stored for is either left out or, with a fill
-//! value, counted as that value over the area it covers. Precipitation stores
-//! no cell where nothing falls, so a fill of zero makes a percentile or a mean
-//! describe the whole block rather than only the part where it rains.
+//! Mean and percentiles use `4^power`, not native-cell counts. Missing area is
+//! excluded or filled before quantization, consistently for MVT and raster.
 
 use std::str::FromStr;
 
@@ -20,8 +11,9 @@ use gpv_products::model::Aggregation;
 /// How a block's value is computed from its cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reducer {
-    /// The product's own aggregation, unweighted, exactly as before.
-    Legacy(Aggregation),
+    Max,
+    Min,
+    BitOr,
     /// The area-weighted mean, rounded half to even once at the end.
     Mean,
     /// The smallest value whose cumulative weight reaches `numerator /
@@ -38,19 +30,17 @@ pub(crate) struct Fraction {
 }
 
 impl Reducer {
-    /// Whether the block statistics of [`super::make_layer`] need every cell
-    /// counted once, which the chunk margins otherwise break.
+    /// Whether source cells must be disjoint for their weights to be valid.
     pub(crate) fn is_weighted(self) -> bool {
-        !matches!(self, Self::Legacy(_))
+        matches!(self, Self::Mean | Self::Percentile(_))
     }
 
     /// The name recorded in the metadata.
     pub(crate) fn name(self) -> String {
         match self {
-            Self::Legacy(Aggregation::Max) => "max".into(),
-            Self::Legacy(Aggregation::Min) => "min".into(),
-            Self::Legacy(Aggregation::RoughAvg) => "rough-avg".into(),
-            Self::Legacy(Aggregation::BitOr) => "bit-or".into(),
+            Self::Max => "max".into(),
+            Self::Min => "min".into(),
+            Self::BitOr => "bit-or".into(),
             Self::Mean => "mean".into(),
             Self::Percentile(fraction) => {
                 let percent = fraction.numerator as f64 * 100.0 / fraction.denominator as f64;
@@ -60,23 +50,33 @@ impl Reducer {
     }
 }
 
+impl From<Aggregation> for Reducer {
+    fn from(aggregation: Aggregation) -> Self {
+        match aggregation {
+            Aggregation::Max => Self::Max,
+            Aggregation::Min => Self::Min,
+            Aggregation::Mean => Self::Mean,
+            Aggregation::BitOr => Self::BitOr,
+        }
+    }
+}
+
 impl FromStr for Reducer {
     type Err = Error;
 
-    /// Parses `max`, `min`, `rough-avg`, `bit-or`, `mean`, or `p<percent>` such
+    /// Parses `max`, `min`, `bit-or`, `mean` (`avg`), or `p<percent>` such
     /// as `p95` or `p99.5`.
     fn from_str(spec: &str) -> Result<Self> {
         let spec = spec.trim();
         Ok(match spec {
-            "max" => Self::Legacy(Aggregation::Max),
-            "min" => Self::Legacy(Aggregation::Min),
-            "rough-avg" => Self::Legacy(Aggregation::RoughAvg),
-            "bit-or" => Self::Legacy(Aggregation::BitOr),
+            "max" => Self::Max,
+            "min" => Self::Min,
+            "bit-or" => Self::BitOr,
             "mean" | "avg" => Self::Mean,
             _ => {
                 let invalid = || {
                     format!(
-                        "--aggregation expects max, min, mean, rough-avg, bit-or or p<percent> \
+                        "--aggregation expects max, min, mean, bit-or or p<percent> \
                          such as p95, but found {spec:?}"
                     )
                 };
@@ -169,7 +169,9 @@ impl BlockSamples {
                     weighted_select(&mut self.samples, rank)
                 }
             }
-            Reducer::Legacy(_) => unreachable!("legacy aggregations are reduced elsewhere"),
+            Reducer::Max | Reducer::Min | Reducer::BitOr => {
+                unreachable!("extrema and bits are reduced by the pixel accumulator")
+            }
         })
     }
 }
@@ -304,12 +306,10 @@ impl Accumulator {
             .checked_add(weight)
             .expect("grid weight fits u64");
         match reducer {
-            Reducer::Mean | Reducer::Legacy(Aggregation::RoughAvg) => {
-                self.sum += i128::from(value) * i128::from(weight)
-            }
-            Reducer::Legacy(Aggregation::Max) => self.max = self.max.max(value),
-            Reducer::Legacy(Aggregation::Min) => self.min = self.min.min(value),
-            Reducer::Legacy(Aggregation::BitOr) => self.bits |= value,
+            Reducer::Mean => self.sum += i128::from(value) * i128::from(weight),
+            Reducer::Max => self.max = self.max.max(value),
+            Reducer::Min => self.min = self.min.min(value),
+            Reducer::BitOr => self.bits |= value,
             Reducer::Percentile(_) => {
                 self.min = self.min.min(value);
                 self.max = self.max.max(value);
@@ -346,17 +346,13 @@ impl Accumulator {
         let fill = fill.filter(|_| missing > 0);
         let total = self.weight + missing;
         Some(match reducer {
-            Reducer::Mean | Reducer::Legacy(Aggregation::RoughAvg) => {
+            Reducer::Mean => {
                 (self.sum + i128::from(fill.unwrap_or(0)) * i128::from(missing)) as f64
                     / total as f64
             }
-            Reducer::Legacy(Aggregation::Max) => {
-                f64::from(fill.map_or(self.max, |v| self.max.max(v)))
-            }
-            Reducer::Legacy(Aggregation::Min) => {
-                f64::from(fill.map_or(self.min, |v| self.min.min(v)))
-            }
-            Reducer::Legacy(Aggregation::BitOr) => f64::from(self.bits | fill.unwrap_or(0)),
+            Reducer::Max => f64::from(fill.map_or(self.max, |v| self.max.max(v))),
+            Reducer::Min => f64::from(fill.map_or(self.min, |v| self.min.min(v))),
+            Reducer::BitOr => f64::from(self.bits | fill.unwrap_or(0)),
             Reducer::Percentile(fraction) => {
                 let rank = ((u128::from(fraction.numerator) * u128::from(total))
                     .div_ceil(u128::from(fraction.denominator)) as u64)
@@ -410,9 +406,7 @@ impl Partial {
         self.merge(
             Self {
                 value: match reducer {
-                    Reducer::Mean | Reducer::Legacy(Aggregation::RoughAvg) => {
-                        i64::from(value) * weight as i64
-                    }
+                    Reducer::Mean => i64::from(value) * weight as i64,
                     _ => i64::from(value),
                 },
                 weight,
@@ -431,10 +425,10 @@ impl Partial {
         }
         self.weight += other.weight;
         self.value = match reducer {
-            Reducer::Mean | Reducer::Legacy(Aggregation::RoughAvg) => self.value + other.value,
-            Reducer::Legacy(Aggregation::Max) => self.value.max(other.value),
-            Reducer::Legacy(Aggregation::Min) => self.value.min(other.value),
-            Reducer::Legacy(Aggregation::BitOr) => self.value | other.value,
+            Reducer::Mean => self.value + other.value,
+            Reducer::Max => self.value.max(other.value),
+            Reducer::Min => self.value.min(other.value),
+            Reducer::BitOr => self.value | other.value,
             Reducer::Percentile(_) => unreachable!("a percentile does not merge"),
         };
     }
@@ -448,12 +442,10 @@ impl Partial {
             ..Accumulator::default()
         };
         match reducer {
-            Reducer::Mean | Reducer::Legacy(Aggregation::RoughAvg) => {
-                accumulator.sum = i128::from(self.value)
-            }
-            Reducer::Legacy(Aggregation::Max) => accumulator.max = narrow(self.value),
-            Reducer::Legacy(Aggregation::Min) => accumulator.min = narrow(self.value),
-            Reducer::Legacy(Aggregation::BitOr) => accumulator.bits = narrow(self.value),
+            Reducer::Mean => accumulator.sum = i128::from(self.value),
+            Reducer::Max => accumulator.max = narrow(self.value),
+            Reducer::Min => accumulator.min = narrow(self.value),
+            Reducer::BitOr => accumulator.bits = narrow(self.value),
             Reducer::Percentile(_) => unreachable!("a percentile does not merge"),
         }
         accumulator.finish(reducer, capacity, fill, &[], &mut BlockSamples::default())
@@ -463,13 +455,13 @@ impl Partial {
 pub(super) fn effective_reducer(reducer: Reducer, capacity: u64) -> Reducer {
     if let Reducer::Percentile(f) = reducer {
         if f.numerator == 0 {
-            return Reducer::Legacy(Aggregation::Min);
+            return Reducer::Min;
         }
         if capacity > 0
             && (u128::from(f.numerator) * u128::from(capacity)).div_ceil(u128::from(f.denominator))
                 == u128::from(capacity)
         {
-            return Reducer::Legacy(Aggregation::Max);
+            return Reducer::Max;
         }
     }
     reducer
@@ -701,6 +693,7 @@ mod tests {
         assert!("p".parse::<Reducer>().is_err());
         assert!("p-1".parse::<Reducer>().is_err());
         assert!("median".parse::<Reducer>().is_err());
+        assert!("rough-avg".parse::<Reducer>().is_err());
         assert_eq!("p99.5".parse::<Reducer>().unwrap().name(), "p99.5");
     }
     #[test]

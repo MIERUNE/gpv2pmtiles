@@ -391,11 +391,7 @@ mod tests {
     fn cell(dn: i32, power: u8) -> Point {
         let mut values = [CompactOptI32::NONE; 4];
         values[0] = value(dn);
-        Point {
-            values,
-            counts: [1, 0, 0, 0],
-            power,
-        }
+        Point { values, power }
     }
 
     /// One cell reaching past every edge of the tile, so the rectangle is
@@ -432,7 +428,8 @@ mod tests {
             name: String::new(),
             base_z: 0,
             grid_spec: grid(),
-            reducer: crate::tile::Reducer::Legacy(gpv_products::model::Aggregation::Max),
+            color_map: None,
+            reducer: crate::tile::Reducer::Max,
             fill: vec![None],
             band_specs: vec![gpv_products::model::BandSpec {
                 name: "DN".to_string(),

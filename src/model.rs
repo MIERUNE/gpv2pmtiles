@@ -5,7 +5,7 @@ use gpv_products::{
 
 use crate::{
     quantize::{BandOmit, BandQuantize},
-    tile::Reducer,
+    tile::{ColorMap, Reducer},
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -94,6 +94,8 @@ pub(crate) struct TilesetSpec {
     pub name: String,
     pub base_z: u8,
     pub grid_spec: LngLatGrid,
+    /// Display colours applied after aggregation and optional quantization.
+    pub color_map: Option<ColorMap>,
     /// How the cells of a block are combined; the product's own aggregation
     /// unless one was chosen.
     pub reducer: Reducer,

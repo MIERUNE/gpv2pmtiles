@@ -1,21 +1,9 @@
 //! Encodes band values into RGBA raster tiles.
 //!
-//! A raster tile carries data rather than a picture, so the client has to know
-//! how to invert whatever was done to it. Every [`ColorEncoding`] therefore
-//! ships a [`ColorEncoding::descriptor`] into the archive metadata. Its
-//! structured channel, offset and scale fields are sufficient to invert the
-//! pixels; no layer has to guess from a tileset name.
-//!
-//! Two hazards apply to every encoding here, and both are quiet when they bite:
-//!
-//! * **Alpha is never a mask.** Several browser image-decoding paths -
-//!   `createImageBitmap` among them - premultiply alpha, which zeroes the
-//!   colour channels of a transparent pixel. That would destroy exactly the
-//!   values the mask is marking. Tiles are always opaque, and coverage is
-//!   spelled out in a colour channel instead.
-//! * **Parameters belong to the archive, never to a tile.** Deriving a range
-//!   per tile would make neighbouring tiles decode the same byte differently,
-//!   and the field would jump across every tile seam.
+//! Data encodings keep channels opaque so browser alpha premultiplication
+//! cannot destroy measurements. Classified output instead paints fixed RGBA
+//! colours for direct display, with transparent missing pixels. Parameters
+//! and colour maps are shared by every tile and recorded in the metadata.
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -68,6 +56,8 @@ impl RasterLayout {
 /// How the band values of one grid cell become a pixel.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum ColorEncoding {
+    /// A display image painted by the product's classified colour map.
+    Classified,
     /// A scalar spread over all 24 colour bits. Exact to `interval`, at the
     /// cost of having no channel left for a mask, so it suits a grid that
     /// covers every tile it appears in - a global model, or terrain.
@@ -154,6 +144,13 @@ impl std::str::FromStr for ColorEncoding {
         };
 
         match name {
+            "classified" => {
+                ensure!(
+                    parameters.is_empty() && spec == "classified",
+                    "classified takes its colours from --color-map"
+                );
+                Ok(Self::Classified)
+            }
             "vector-field" => {
                 let [component_limit] = numbers(1)?[..] else {
                     unreachable!("the count was checked")
@@ -187,7 +184,7 @@ impl std::str::FromStr for ColorEncoding {
             }
             _ => bail!(
                 "unknown raster encoding {name:?}. Expected one of \
-                 vector-field:<component-limit>, scalar16:<min>,<max>, scalar24:<base>,<interval>"
+                 classified, vector-field:<component-limit>, scalar16:<min>,<max>, scalar24:<base>,<interval>"
             ),
         }
     }
@@ -241,7 +238,7 @@ impl ColorEncoding {
     /// How many bands the encoding consumes, in band order.
     pub(crate) fn bands(&self) -> usize {
         match self {
-            Self::Scalar24 { .. } | Self::Scalar16 { .. } => 1,
+            Self::Classified | Self::Scalar24 { .. } | Self::Scalar16 { .. } => 1,
             Self::VectorField { .. } => 2,
         }
     }
@@ -252,7 +249,7 @@ impl ColorEncoding {
     /// is called.
     fn required_bands(&self) -> Option<&'static [&'static str]> {
         match self {
-            Self::Scalar24 { .. } | Self::Scalar16 { .. } => None,
+            Self::Classified | Self::Scalar24 { .. } | Self::Scalar16 { .. } => None,
             // East-west first, north-south second, which is the order the
             // components are read in and the one the GRIB2 products use.
             Self::VectorField { .. } => Some(&["u", "v"]),
@@ -290,6 +287,7 @@ impl ColorEncoding {
     /// Whether encoding these values would saturate rather than represent them.
     fn clips(&self, values: [f64; 2]) -> bool {
         match *self {
+            Self::Classified => false,
             Self::Scalar24 { base, interval } => {
                 // Zero is a value here, not a reserved code: this encoding has
                 // no mask, so `base` itself has to be representable. Counting
@@ -310,11 +308,13 @@ impl ColorEncoding {
 
     /// The pixel written where the grid has no value.
     ///
-    /// Always opaque. For a vector field the components also sit at zero, so a
+    /// Classified output is transparent; data encodings are opaque. For a
+    /// vector field the components also sit at zero, so a
     /// client that ignores the mask sees calm air rather than a hard edge of
     /// maximum wind.
     pub(super) fn off_grid(&self) -> [u8; 4] {
         match self {
+            Self::Classified => [0; 4],
             Self::Scalar24 { .. } => [0, 0, 0, 255],
             Self::Scalar16 { .. } => [0, 0, 0, 255],
             Self::VectorField { .. } => [ZERO_CODE as u8, ZERO_CODE as u8, 0, 255],
@@ -322,11 +322,23 @@ impl ColorEncoding {
     }
 
     /// Encodes the physical values of one grid cell.
+    fn paint(&self, values: [f64; 2], spec: &TilesetSpec) -> [u8; 4] {
+        match self {
+            Self::Classified => spec
+                .color_map
+                .as_ref()
+                .expect("classified map validated before rendering")
+                .paint(values[0]),
+            _ => self.encode(values),
+        }
+    }
+
     fn encode(&self, values: [f64; 2]) -> [u8; 4] {
         if values[..self.bands()].iter().any(|value| value.is_nan()) {
             return self.off_grid();
         }
         match *self {
+            Self::Classified => unreachable!("classified pixels are painted with their colour map"),
             Self::Scalar24 { base, interval } => {
                 let code = normalize((values[0] - base) / interval, 0.0, SCALAR24_CODES) as u32;
                 [(code >> 16) as u8, (code >> 8) as u8, code as u8, 255]
@@ -352,6 +364,9 @@ impl ColorEncoding {
     /// without being told anything else.
     pub(crate) fn descriptor(&self) -> Value {
         match *self {
+            Self::Classified => {
+                json!({"encoding": "classified", "purpose": "display", "color_space": "srgb", "alpha": "straight", "decode": null, "mask": {"kind": "alpha", "missing": 0}})
+            }
             Self::Scalar24 { base, interval } => json!({
                 "encoding": "scalar-24",
                 "base": base,
@@ -694,10 +709,11 @@ pub(super) fn render_raster_tile(
     // Matches the filter the metadata asks the client for: interpolating here
     // and then telling the client not to would put the invented values in the
     // tile anyway.
-    let interpolate = !band_scales
-        .iter()
-        .take(bands)
-        .any(|band| band.is_quantized());
+    let interpolate = encoding != ColorEncoding::Classified
+        && !band_scales
+            .iter()
+            .take(bands)
+            .any(|band| band.is_quantized());
 
     let spec = &tileset_spec.grid_spec;
     let size = layout.image_size() as usize;
@@ -736,11 +752,15 @@ pub(super) fn render_raster_tile(
                 continue;
             };
 
-            let mut rgba = encoding.encode(values);
+            let mut rgba = encoding.paint(values, tileset_spec);
             if !on_grid {
                 // The value stays, so that a client filtering across the edge
                 // blends against real data; only the flag says it is outside.
-                rgba[2] = encoding.off_grid()[2];
+                if encoding == ColorEncoding::Classified {
+                    rgba = encoding.off_grid();
+                } else {
+                    rgba[2] = encoding.off_grid()[2];
+                }
             } else {
                 covered = true;
             }
@@ -752,7 +772,11 @@ pub(super) fn render_raster_tile(
     if !covered {
         return Ok(None);
     }
-    Ok(Some(encode_png(&pixels, layout.image_size())?))
+    Ok(Some(encode_png(
+        &pixels,
+        layout.image_size(),
+        encoding == ColorEncoding::Classified,
+    )?))
 }
 
 /// Whether a zoom aggregates the cells under each pixel rather than sampling
@@ -864,13 +888,17 @@ pub(super) fn render_pixel_tile(
                 }
             }
             let index = (row * side + column) * 4;
-            rgba[index..index + 4].copy_from_slice(&encoding.encode(values));
+            rgba[index..index + 4].copy_from_slice(&encoding.paint(values, spec));
             covered = true;
         });
         if !covered {
             return Ok(None);
         }
-        return Ok(Some(encode_png(&rgba, layout.image_size())?));
+        return Ok(Some(encode_png(
+            &rgba,
+            layout.image_size(),
+            encoding == ColorEncoding::Classified,
+        )?));
     }
 
     let Some(size) = aggregate_pixels(
@@ -914,14 +942,18 @@ pub(super) fn render_pixel_tile(
             }
         }
         if present {
-            rgba[index * 4..index * 4 + 4].copy_from_slice(&encoding.encode(values));
+            rgba[index * 4..index * 4 + 4].copy_from_slice(&encoding.paint(values, spec));
             covered = true;
         }
     }
     if !covered {
         return Ok(None);
     }
-    Ok(Some(encode_png(&rgba, layout.image_size())?))
+    Ok(Some(encode_png(
+        &rgba,
+        layout.image_size(),
+        encoding == ColorEncoding::Classified,
+    )?))
 }
 
 /// The product's pyramid, when it can stand in for gathering a window's
@@ -1149,11 +1181,14 @@ fn finish_raw(raw: f64, b: usize, spec: &TilesetSpec, scale: &BandScale<'_>) -> 
     })
 }
 
-fn encode_png(pixels: &[u8], image_size: u32) -> Result<Vec<u8>> {
+fn encode_png(pixels: &[u8], image_size: u32, display: bool) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     let mut encoder = png::Encoder::new(&mut buffer, image_size, image_size);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
+    if display {
+        encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+    }
     // Leaves the adaptive row filter this preset selects in place. A field is
     // smooth and its off-grid margin is constant, so the filters predict it
     // almost perfectly: measured over one archive, turning them off grew it
@@ -1175,6 +1210,20 @@ fn encode_png(pixels: &[u8], image_size: u32) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_png_declares_srgb_while_data_png_keeps_exact_channels() {
+        for display in [false, true] {
+            let rgba = [17, 34, 51, 128];
+            let bytes = encode_png(&rgba, 1, display).unwrap();
+            let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+            let mut reader = decoder.read_info().unwrap();
+            assert_eq!(reader.info().srgb.is_some(), display);
+            let mut decoded = [0; 4];
+            reader.next_frame(&mut decoded).unwrap();
+            assert_eq!(decoded, rgba);
+        }
+    }
 
     /// A tiny client driven only by the descriptor JSON. Round-trip tests use
     /// this instead of matching on [`ColorEncoding`], so changing metadata
@@ -1678,6 +1727,7 @@ mod tests {
             let empty = decode(&descriptor, [0, 0, 0, 255])[0];
             let span = (full - empty).abs();
             let expected = match encoding {
+                ColorEncoding::Classified => unreachable!("data encodings only"),
                 ColorEncoding::Scalar24 { interval, .. } => SCALAR24_CODES * interval,
                 ColorEncoding::Scalar16 { min, max } => max - min,
                 ColorEncoding::VectorField { component_limit } => {
@@ -1771,7 +1821,7 @@ mod tests {
             }
         }
 
-        let png = encode_png(&pixels, IMAGE_EXTENT).unwrap();
+        let png = encode_png(&pixels, IMAGE_EXTENT, false).unwrap();
         assert!(
             png.len() < pixels.len() / 100,
             "expected the filters to flatten the tile, but {} bytes came out of {}",
@@ -1927,7 +1977,7 @@ mod tests {
             .repeat((IMAGE_EXTENT * IMAGE_EXTENT) as usize);
         pixels[..4].copy_from_slice(&[10, 200, 255, 255]);
 
-        let png = encode_png(&pixels, IMAGE_EXTENT).unwrap();
+        let png = encode_png(&pixels, IMAGE_EXTENT, false).unwrap();
         let decoder = png::Decoder::new(std::io::Cursor::new(&png));
         let mut reader = decoder.read_info().unwrap();
         let mut decoded = vec![0; reader.output_buffer_size().unwrap()];

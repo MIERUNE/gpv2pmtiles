@@ -212,7 +212,7 @@ fn raster_statistics_match_in_horizontal_and_vertical_tile_margins() {
     };
     let size = 514;
     for method in [
-        Aggregation::Legacy(gpv_products::model::Aggregation::Max),
+        Aggregation::Max,
         Aggregation::Mean,
         "p95".parse::<Aggregation>().unwrap(),
     ] {
@@ -323,7 +323,7 @@ fn raster_statistics_wrap_at_the_antimeridian() {
         ..grid()
     };
     for method in [
-        Aggregation::Legacy(gpv_products::model::Aggregation::Max),
+        Aggregation::Max,
         Aggregation::Mean,
         "p95".parse::<Aggregation>().unwrap(),
     ] {
@@ -624,4 +624,151 @@ fn wrapped_constant_field_percentile_does_not_panic() {
             interval: 0.01,
         },
     );
+}
+
+#[test]
+fn product_default_mean_and_aliases_validate_source_area() {
+    let overlap = [(0, 0, 2, 10), (1, 1, 0, 20)];
+    for method in [None, Some("mean"), Some("avg")] {
+        let error = crate::archive::prepare_selected_products(vec![raw(&overlap, grid())], method)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("overlapping source cells"),
+            "{method:?}: {error}"
+        );
+    }
+    assert!(
+        crate::archive::prepare_selected_products(vec![raw(&overlap, grid())], Some("max")).is_ok()
+    );
+}
+
+#[test]
+fn mean_aliases_preserve_mixed_cell_values_in_vector_and_raster() {
+    // The old native-cell average would be 55; the area-weighted mean is 260/17.
+    let cells = [(0, 0, 2, 10), (4, 0, 0, 100)];
+    let default = crate::archive::prepare_selected_products(vec![raw(&cells, grid())], None)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(default.spec.reducer, Aggregation::Mean);
+    assert_eq!(mvt_value(&default), 15);
+    let output = TileOutput::Mvt(MvtLayout::default());
+    let encoding = ColorEncoding::Scalar16 {
+        min: 0.0,
+        max: 110.0,
+    };
+    for method in ["mean", "avg"] {
+        let explicit = product(&cells, grid(), method.parse().unwrap());
+        for zxy in [(0, 0, 0), (7, 64, 63)] {
+            assert_eq!(
+                tile::make_layer(&TileContext::new(zxy), &default, "mean", output).unwrap(),
+                tile::make_layer(&TileContext::new(zxy), &explicit, "mean", output).unwrap(),
+                "{method} {zxy:?}"
+            );
+            assert_eq!(
+                raster(&default, zxy, encoding),
+                raster(&explicit, zxy, encoding),
+                "{method} {zxy:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn classified_pngs_paint_aggregated_values_and_match_the_pyramid() {
+    let mut product = product(&[(0, 0, 0, 1), (1, 0, 0, 2)], grid(), Aggregation::Mean);
+    product.spec.color_map = Some("0:#ff0000,1.5:#0000ff80".parse().unwrap());
+    let layout = RasterLayout::new(ColorEncoding::Classified);
+    let pixels = raster_with_size(&product, (0, 0, 0), layout);
+    assert!(pixels.as_chunks::<4>().0.iter().any(|px| px[3] != 0));
+    assert!(
+        pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|px| *px == [0; 4] || *px == [0, 0, 255, 128])
+    );
+    crate::archive::build_pyramid(&mut product, 0, 0, TileOutput::Raster(layout));
+    assert!(product.pyramid.is_some());
+    assert_eq!(pixels, raster_with_size(&product, (0, 0, 0), layout));
+    let metadata = crate::metadata::raster_encoding(Some(&product), layout);
+    assert_eq!(metadata["encoding"], "classified");
+    assert_eq!(metadata["decode"], serde_json::Value::Null);
+    assert_eq!(
+        metadata["color_map"]["stops"][1]["rgba"],
+        serde_json::json!([0, 0, 255, 128])
+    );
+    assert_eq!(metadata["sampling"]["filter"], "nearest");
+    assert_eq!(metadata["resampling"]["upsampling"], "nearest");
+}
+
+#[test]
+fn classified_high_zoom_keeps_source_classes_and_missing_pixels_transparent() {
+    let mut product = product(&[(0, 0, 0, 1), (1, 0, 0, 2)], grid(), Aggregation::Max);
+    product.spec.color_map = Some("1:#ff0000,1.25:#00ff00,1.75:#0000ff".parse().unwrap());
+    let pixels = raster(&product, (7, 64, 63), ColorEncoding::Classified);
+    let colors = pixels.as_chunks::<4>().0;
+    assert!(colors.contains(&[255, 0, 0, 255]));
+    assert!(colors.contains(&[0, 0, 255, 255]));
+    assert!(colors.contains(&[0; 4]));
+    assert!(
+        colors
+            .iter()
+            .all(|px| matches!(*px, [0, 0, 0, 0] | [255, 0, 0, 255] | [0, 0, 255, 255]))
+    );
+}
+
+#[test]
+fn classified_colours_follow_quantized_output_values() {
+    let mut product = product(&[(0, 0, 0, 1), (1, 0, 0, 2)], grid(), Aggregation::Mean);
+    product.spec.quantize =
+        crate::quantize::resolve(&["0:10,1:20".into()], &product.spec.band_specs).unwrap();
+    product.spec.color_map = Some("0:#ff0000,15:#0000ff".parse().unwrap());
+    let pixels = raster(&product, (0, 0, 0), ColorEncoding::Classified);
+    assert!(pixels.as_chunks::<4>().0.contains(&[0, 0, 255, 255]));
+    assert!(
+        pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|px| *px == [0; 4] || *px == [0, 0, 255, 255])
+    );
+    product.spec.omit_class = crate::quantize::resolve_class_omits(
+        &["20".into()],
+        &product.spec.quantize,
+        &product.spec.band_specs,
+    )
+    .unwrap();
+    assert!(
+        tile::make_layer(
+            &TileContext::new((0, 0, 0)),
+            &product,
+            "rain",
+            TileOutput::Raster(RasterLayout::new(ColorEncoding::Classified))
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
+#[test]
+fn classified_tile_margins_match_across_a_seam() {
+    let cells: Vec<_> = (0..65)
+        .flat_map(|x| (0..65).map(move |y| (x, y, 0, i32::from(x) + i32::from(y))))
+        .collect();
+    let mut product = product(
+        &cells,
+        LngLatGrid {
+            lng_0: -0.32,
+            lat_0: -0.32,
+            ..grid()
+        },
+        Aggregation::Mean,
+    );
+    product.spec.color_map = Some("0:#00aaff80,50:#ffff00,100:#ff0000".parse().unwrap());
+    let left = raster(&product, (1, 0, 0), ColorEncoding::Classified);
+    let right = raster(&product, (1, 1, 0), ColorEncoding::Classified);
+    assert!(left.as_chunks::<4>().0.iter().any(|px| px[3] != 0));
+    assert!(right.as_chunks::<4>().0.iter().any(|px| px[3] != 0));
+    assert_horizontal(&left, &right);
 }

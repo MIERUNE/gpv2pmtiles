@@ -63,9 +63,8 @@ fn level_descriptor(product: &PreparedProduct) -> Value {
     }
 }
 
-/// With `pixels`, the tiles aggregate into pixels, where an average is the
-/// weighted mean whichever was asked for.
-fn aggregation_descriptor(product: &PreparedProduct, pixels: bool) -> Value {
+/// Pixel aggregation uses basic-grid-cell weights for every output format.
+fn aggregation_descriptor(product: &PreparedProduct) -> Value {
     let spec = &product.spec;
     let fill = spec
         .band_specs
@@ -79,24 +78,11 @@ fn aggregation_descriptor(product: &PreparedProduct, pixels: bool) -> Value {
             Some((band.name.clone(), json!(physical)))
         })
         .collect::<Map<String, Value>>();
-    let method = if pixels
-        && matches!(
-            spec.reducer,
-            Reducer::Legacy(gpv_products::model::Aggregation::RoughAvg)
-        ) {
-        "mean".into()
-    } else {
-        spec.reducer.name()
-    };
     json!({
-        "method": method,
+        "method": spec.reducer.name(),
         "fill": fill,
         "missing_default": "exclude-unless-filled",
-        "weighting": if pixels || spec.reducer.is_weighted() {
-            "basic-grid-cell-count"
-        } else {
-            "native-cell-count"
-        },
+        "weighting": "basic-grid-cell-count",
         "empty_block": "missing",
         "quantization": "after-aggregation",
     })
@@ -129,13 +115,17 @@ pub(crate) fn raster_encoding(product: Option<&PreparedProduct>, layout: RasterL
     object.insert("image_size".into(), json!(layout.image_size()));
 
     if let Some(product) = product {
-        object.insert("aggregation".into(), aggregation_descriptor(product, true));
+        let classified = layout.encoding == ColorEncoding::Classified;
+        if let Some(map) = product.spec.color_map.as_ref().filter(|_| classified) {
+            object.insert("color_map".into(), map.descriptor());
+        }
+        object.insert("aggregation".into(), aggregation_descriptor(product));
         object.insert("resampling".into(),json!({
             "downsampling":"basic-cell-centre-aggregation",
             "weighting":"basic-grid-cell-count",
             "ground_area_weighted":false,
             "downsampling_condition":"either-native-axis-finer-than-pixel-somewhere-in-grid-frame",
-            "upsampling":if product.spec.quantize.iter().any(Option::is_some) {"nearest"} else {"bilinear"},
+            "upsampling":if classified || product.spec.quantize.iter().any(Option::is_some) {"nearest"} else {"bilinear"},
             "source_interpretation_at_low_zoom":"constant-per-native-cell",
         }));
         object.insert(
@@ -147,7 +137,9 @@ pub(crate) fn raster_encoding(product: Option<&PreparedProduct>, layout: RasterL
                     .collect::<Vec<_>>()
             ),
         );
-        object.insert("sampling".into(), sampling_contract(product));
+        object.insert("sampling".into(), if classified {
+            json!({"sample_space": "color", "texture_format": "rgba8unorm-srgb", "filter": "nearest", "color_space_conversion": "srgb", "premultiply_alpha": true, "mipmaps": false})
+        } else { sampling_contract(product) });
         object.insert("level".into(), level_descriptor(product));
     }
     if let ColorEncoding::VectorField { .. } = layout.encoding {
@@ -285,9 +277,9 @@ pub(crate) fn generate_metadata(
 
     // MVT and raster low zooms both aggregate into Mercator pixels.
     let aggregation = products.first().and_then(|product| {
-        (product.spec.reducer != Reducer::Legacy(product.product_id.aggregation())
+        (product.spec.reducer != Reducer::from(product.product_id.aggregation())
             || matches!(output, TileOutput::Mvt(_)))
-        .then(|| aggregation_descriptor(product, true))
+        .then(|| aggregation_descriptor(product))
     });
 
     let mut metadata = Map::new();

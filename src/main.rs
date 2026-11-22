@@ -101,12 +101,11 @@ struct Cli {
     #[arg(long)]
     omit_zero: bool,
 
-    /// How the cells merged into a pixel at a low zoom are combined, instead
-    /// of the product's own aggregation: max, min, rough-avg or bit-or, as the
-    /// products recommend them, or a statistic that weighs each cell by its
-    /// area on the grid:
+    /// Override how cells are combined into a low-zoom pixel: max, min,
+    /// mean, bit-or or p<percent>. Mean and percentiles weigh each cell by
+    /// its area on the grid:
     ///
-    ///   mean (avg)    the grid-area-weighted mean; vector raw values round half to even
+    ///   mean (avg)  the grid-area-weighted mean; vector raw values round half to even
     ///   p<percent>    the smallest value covering at least that share of
     ///                 the pixel, without interpolation, such as p95 or p99.5
     ///
@@ -116,7 +115,8 @@ struct Cli {
     aggregation: Option<String>,
 
     /// Physical value counted over the part of a pixel no cell is stored for,
-    /// with --aggregation mean or p<percent>, overriding --missing for a band.
+    /// for mean or p<percent>, including a product's default mean, overriding
+    /// --missing for a band.
     /// Precipitation and snow already default to zero fill. The value must be one
     /// the band can hold exactly. Prefix with a band name when the product has
     /// several bands, and repeat as needed. A pixel with no stored cell stays
@@ -129,14 +129,15 @@ struct Cli {
     #[arg(long, value_name = "POLICY", allow_hyphen_values = true)]
     missing: Option<String>,
 
-    /// Write RGBA raster tiles instead of MVT, encoding band values into the
-    /// colour channels so that a shader can read them back.
+    /// Write RGBA PNG raster tiles instead of MVT. Choose classified display
+    /// colours, or encode values into channels for decoding by a shader.
     ///
     /// The parameters belong to the archive rather than to a tile, so that
     /// every tile decodes the same way and the field does not jump at a seam.
     /// The channels, offset, scale and mask needed to decode them are recorded
     /// as structured archive metadata.
     ///
+    ///   classified                  display colours supplied by --color-map.
     ///   vector-field:<component-limit>
     ///                               two bands (u, v) for a particle layer.
     ///                               Signed-normalised into red and green with
@@ -157,6 +158,13 @@ struct Cli {
     /// replaced, and timestamps use UTC YYYYMMDDHHMMSS.
     #[arg(long, value_name = "SPEC", verbatim_doc_comment)]
     raster: Option<String>,
+
+    /// Fixed display colours, with inclusive lower bounds: 0:#00000000,1:#00aaff.
+    /// Accepts #RRGGBB or #RRGGBBAA, or @FILE.json with per-class opacity.
+    /// Requires --raster classified. Missing
+    /// values and values below the first bound are transparent.
+    #[arg(long, value_name = "STOPS", allow_hyphen_values = true)]
+    color_map: Option<String>,
 
     /// Pixels across a --raster tile, 256 or 512. A 256-pixel tile at zoom
     /// z + 1 holds the same pixels as a quarter of a 512-pixel one at z, so
@@ -199,6 +207,7 @@ fn main() -> Result<()> {
             buffer: cli.buffer,
             detail: cli.detail,
             raster: cli.raster,
+            color_map: cli.color_map,
             raster_size: cli.raster_size,
             manifest: cli.manifest,
             skip_analysis: cli.skip_analysis,

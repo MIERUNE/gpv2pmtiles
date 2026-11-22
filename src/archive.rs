@@ -18,8 +18,8 @@ use crate::{
     model::PreparedProduct,
     prepare, quantize,
     tile::{
-        ColorEncoding, DetailSchedule, MvtLayout, RASTER_TILE_SIZES, RasterLayout, Reducer,
-        TileContext, TileOutput, Zxy, make_layer, zxy_to_chunk_id_range,
+        ColorEncoding, ColorMap, DetailSchedule, MvtLayout, RASTER_TILE_SIZES, RasterLayout,
+        Reducer, TileContext, TileOutput, Zxy, make_layer, zxy_to_chunk_id_range,
     },
 };
 
@@ -44,7 +44,7 @@ pub struct ConvertOptions {
     /// product's own aggregation; see [`crate::tile::Reducer`].
     pub aggregation: Option<String>,
     /// Physical value counted over the part of a pixel no cell is stored for,
-    /// as `[<band>=]<value>`. Needs a weighted `aggregation`.
+    /// as `[<band>=]<value>`. Needs a weighted aggregation, explicit or default.
     pub fill: Vec<String>,
     /// Missing-cell policy for weighted statistics: exclude or a physical fill value.
     pub missing: Option<String>,
@@ -58,6 +58,8 @@ pub struct ConvertOptions {
     pub detail: Option<String>,
     /// Emit RGBA raster tiles with this colour encoding instead of MVT.
     pub raster: Option<String>,
+    /// Fixed display colours: <lower>:#RRGGBB[AA],...; requires --raster classified.
+    pub color_map: Option<String>,
     /// Pixels across a raster tile, 256 or 512. Defaults to 512.
     pub raster_size: Option<u32>,
     /// Write an index of the raster archives to this path.
@@ -88,6 +90,7 @@ impl Default for ConvertOptions {
             buffer: None,
             detail: None,
             raster: None,
+            color_map: None,
             raster_size: None,
             manifest: None,
             skip_analysis: false,
@@ -126,15 +129,7 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
         options.skip_analysis,
         options.min_lead_time,
     )?;
-    // Weighted statistics count every cell's area once, so they need input
-    // whose cells neither overlap nor disagree.
-    let strict = options
-        .aggregation
-        .as_deref()
-        .map(str::parse::<Reducer>)
-        .transpose()?
-        .is_some_and(Reducer::is_weighted);
-    let mut products = prepare::prepare_products(products, strict)?;
+    let mut products = prepare_selected_products(products, options.aggregation.as_deref())?;
     let layer_names = build_layer_names(options, products.len())?;
 
     ensure_compatible_products(&products)?;
@@ -151,6 +146,14 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
         &options.fill,
         options.missing.as_deref(),
     )?;
+    let color_map = options
+        .color_map
+        .as_deref()
+        .map(str::parse::<ColorMap>)
+        .transpose()?;
+    for product in &mut products {
+        product.spec.color_map = color_map.clone();
+    }
     let output_format = output_format(&products, options)?;
     // A smaller raster tile needs one more zoom to reach the same pixels.
     let zoom_offset = match output_format {
@@ -229,6 +232,23 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
             Ok(())
         }
     }
+}
+
+/// Validate source-cell area for both explicit and product-default statistics.
+pub(crate) fn prepare_selected_products(
+    products: Vec<prepare::RawProduct>,
+    aggregation: Option<&str>,
+) -> Result<Vec<PreparedProduct>> {
+    let reducer = aggregation.map(str::parse::<Reducer>).transpose()?;
+    let strict = reducer.map_or_else(
+        || {
+            products
+                .iter()
+                .any(|p| Reducer::from(p.product_id.aggregation()).is_weighted())
+        },
+        Reducer::is_weighted,
+    );
+    prepare::prepare_products(products, strict)
 }
 
 /// Builds the pyramid a product's lattice zooms read, if it has any and its
@@ -684,6 +704,14 @@ fn validate_options(options: &ConvertOptions) -> Result<()> {
     if let Some(spec) = &options.raster {
         spec.parse::<ColorEncoding>()?;
     }
+    let classified = options.raster.as_deref() == Some("classified");
+    ensure!(
+        classified == options.color_map.is_some(),
+        "--raster classified requires --color-map; --color-map only applies to classified output"
+    );
+    if let Some(map) = &options.color_map {
+        map.parse::<ColorMap>()?;
+    }
     if let Some(extent) = options.extent {
         ensure!(
             (1..=MAX_MVT_EXTENT).contains(&extent),
@@ -726,13 +754,13 @@ fn validate_options(options: &ConvertOptions) -> Result<()> {
         .map(str::parse::<Reducer>)
         .transpose()?;
     ensure!(
-        options.fill.is_empty() || reducer.is_some_and(Reducer::is_weighted),
+        options.fill.is_empty() || reducer.is_none_or(Reducer::is_weighted),
         "--fill counts the area no cell covers, which only --aggregation mean or p<percent> weigh"
     );
     quantize::validate_fill_syntax(&options.fill)?;
     if let Some(missing) = &options.missing {
         ensure!(
-            reducer.is_some_and(Reducer::is_weighted),
+            reducer.is_none_or(Reducer::is_weighted),
             "--missing requires --aggregation mean or p<percent>"
         );
         if missing != "exclude" {
@@ -806,11 +834,16 @@ fn apply_aggregation(
     fill: &[String],
     missing: Option<&str>,
 ) -> Result<()> {
-    let Some(aggregation) = aggregation else {
-        return Ok(());
-    };
-    let reducer = aggregation.parse::<Reducer>()?;
+    let override_reducer = aggregation.map(str::parse::<Reducer>).transpose()?;
     for (index, product) in products.iter_mut().enumerate() {
+        let reducer =
+            override_reducer.unwrap_or_else(|| Reducer::from(product.product_id.aggregation()));
+        ensure!(
+            reducer.is_weighted() || (fill.is_empty() && missing.is_none()),
+            "--fill and --missing require mean or p<percent>; {} uses {}",
+            product.product_id.path(),
+            reducer.name()
+        );
         product.spec.reducer = reducer;
         if matches!(reducer, Reducer::Percentile(_)) {
             use gpv_products::products::GpvProductElement::*;
@@ -1617,6 +1650,37 @@ mod tests {
     }
 
     #[test]
+    fn display_map_requires_classified_raster_and_valid_colours() {
+        for (raster, map, valid) in [
+            (Some("classified"), Some("0:#00000000,1:#00aaff"), true),
+            (Some("classified"), None, false),
+            (None, Some("0:#ffffff"), false),
+            (Some("scalar16:0,100"), Some("0:#ffffff"), false),
+            (Some("classified"), Some("0:#xyzxyz"), false),
+        ] {
+            assert_eq!(
+                validate_options(&ConvertOptions {
+                    raster: raster.map(str::to_owned),
+                    color_map: map.map(str::to_owned),
+                    ..Default::default()
+                })
+                .is_ok(),
+                valid
+            );
+        }
+        assert!(
+            ColorEncoding::Classified
+                .check_bands(&["rain".into()])
+                .is_ok()
+        );
+        assert!(
+            ColorEncoding::Classified
+                .check_bands(&["u".into(), "v".into()])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn extent_and_buffer_are_bounded() {
         for (extent, buffer) in [
             (Some(0), None),
@@ -1692,7 +1756,7 @@ mod tests {
 
     fn product(minutes: i64, process: GeneratingProcessType) -> PreparedProduct {
         use gpv_products::{
-            model::{Aggregation, LngLatGrid},
+            model::LngLatGrid,
             products::{GpvProductElement, GpvProductIdentifier},
         };
         use jiff::Timestamp;
@@ -1709,13 +1773,14 @@ mod tests {
             spec: crate::model::TilesetSpec {
                 name: product_id.path(),
                 base_z: 0,
+                color_map: None,
                 grid_spec: LngLatGrid {
                     lng_0: 0.0,
                     lat_0: 0.0,
                     lng_denom: 1.0,
                     lat_denom: 1.0,
                 },
-                reducer: crate::tile::Reducer::Legacy(Aggregation::Max),
+                reducer: crate::tile::Reducer::Max,
                 fill: Vec::new(),
                 band_specs: Vec::new(),
                 quantize: Vec::new(),
@@ -1727,6 +1792,79 @@ mod tests {
             chunks: Vec::new(),
             pyramid: None,
         }
+    }
+
+    #[test]
+    fn default_mean_and_aliases_share_missing_policy_and_metadata() {
+        use gpv_products::{model::BandSpec, products::GpvProductElement};
+        for kind in [
+            GpvProductElement::GsmTemperature,
+            GpvProductElement::GsmPrecipitation,
+        ] {
+            let mut expected = None;
+            for method in [None, Some("mean"), Some("avg")] {
+                let mut products = [product(0, GeneratingProcessType::Forecast)];
+                products[0].product_id.kind = kind;
+                products[0].spec.band_specs = vec![BandSpec {
+                    name: "value".into(),
+                    ..Default::default()
+                }];
+                apply_aggregation(&mut products, method, &[], None).unwrap();
+                assert_eq!(products[0].spec.reducer, Reducer::Mean);
+                assert_eq!(
+                    products[0].spec.fill,
+                    vec![if default_zero_fill(kind) {
+                        Some(0)
+                    } else {
+                        None
+                    }]
+                );
+                let actual = metadata::generate_metadata(
+                    "mean",
+                    &products,
+                    &["value".into()],
+                    [0.0; 4],
+                    metadata::MetadataOptions {
+                        min_zoom: 0,
+                        max_zoom: 1,
+                        output: TileOutput::Mvt(MvtLayout::default()),
+                        sequence: None,
+                        range: None,
+                    },
+                );
+                // Same explicit statistic and default statistic must describe the same tiles.
+                let descriptor = actual.get("aggregation").unwrap().clone();
+                assert_eq!(descriptor["method"], "mean");
+                if let Some(expected) = &expected {
+                    assert_eq!(&descriptor, expected);
+                } else {
+                    expected = Some(descriptor);
+                }
+                apply_aggregation(&mut products, method, &["value=5".into()], Some("exclude"))
+                    .unwrap();
+                assert_eq!(products[0].spec.fill, vec![Some(5)]);
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_missing_policy_checks_the_product_default() {
+        use gpv_products::{model::BandSpec, products::GpvProductElement};
+        let options = ConvertOptions {
+            missing: Some("0".into()),
+            ..Default::default()
+        };
+        validate_options(&options).unwrap();
+        let mut products = [product(0, GeneratingProcessType::Forecast)];
+        products[0].spec.band_specs = vec![BandSpec {
+            name: "value".into(),
+            ..Default::default()
+        }];
+        assert!(apply_aggregation(&mut products, None, &[], options.missing.as_deref()).is_err());
+        assert!(apply_aggregation(&mut products, None, &["1".into()], None).is_err());
+        products[0].product_id.kind = GpvProductElement::GsmTemperature;
+        apply_aggregation(&mut products, None, &[], options.missing.as_deref()).unwrap();
+        assert_eq!(products[0].spec.fill, vec![Some(0)]);
     }
 
     #[test]
@@ -1799,7 +1937,7 @@ mod tests {
 
     #[test]
     fn missing_policy_requires_weighted_statistics() {
-        for method in [None, Some("max"), Some("rough-avg")] {
+        for method in [Some("max"), Some("min"), Some("bit-or")] {
             assert!(
                 validate_options(&ConvertOptions {
                     aggregation: method.map(str::to_owned),

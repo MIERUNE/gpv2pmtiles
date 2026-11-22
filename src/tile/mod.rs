@@ -1,9 +1,11 @@
+mod color_map;
 mod detail;
 mod mvt;
 mod pyramid;
 mod raster;
 mod reduce;
 
+pub(crate) use color_map::ColorMap;
 pub(crate) use detail::DetailSchedule;
 pub(crate) use pyramid::Pyramid;
 pub(crate) use reduce::Reducer;
@@ -16,7 +18,6 @@ mod rect_union;
 
 use anyhow::Result;
 use fast_mvt::MvtValue;
-use gpv_products::model::Aggregation;
 
 use fast_hilbert::xy2h;
 
@@ -72,7 +73,6 @@ impl TileContext {
 #[derive(Default, PartialEq, Eq, Debug, PartialOrd)]
 struct Point {
     values: [CompactOptI32; 4],
-    counts: [i32; 4],
     power: u8,
 }
 
@@ -165,39 +165,21 @@ impl BandScale<'_> {
 }
 
 #[inline]
-fn aggregate_band(values: &[CompactOptI32], aggregation: Aggregation) -> (CompactOptI32, i32) {
-    match aggregation {
-        Aggregation::Max => (CompactOptI32::new(values.iter().flatten().max()), 0),
-        Aggregation::Min => (CompactOptI32::new(values.iter().flatten().min()), 0),
-        Aggregation::RoughAvg => {
-            let mut sum = None;
-            let mut count = 0usize;
-            for value in values.iter().flatten() {
-                sum = Some(match sum {
-                    Some(sum) => sum + value,
-                    None => value,
-                });
-                count += 1;
-            }
-            (CompactOptI32::new(sum), count as i32)
-        }
-        Aggregation::BitOr => (
-            CompactOptI32::new(
-                values
-                    .iter()
-                    .flatten()
-                    .fold(None, |acc, value| Some(acc.unwrap_or(0) | value)),
-            ),
-            0,
-        ),
-    }
+fn aggregate_band(values: &[CompactOptI32], aggregation: Reducer) -> CompactOptI32 {
+    // This path only deduplicates copies of one source cell. A mean or
+    // percentile has the source value itself; strict preparation checked it.
+    CompactOptI32::new(match aggregation {
+        Reducer::Max | Reducer::Mean | Reducer::Percentile(_) => values.iter().flatten().max(),
+        Reducer::Min => values.iter().flatten().min(),
+        Reducer::BitOr => values.iter().flatten().reduce(|left, right| left | right),
+    })
 }
 
 fn merge_point(
     points: &mut PointMap<(u32, u32), Point>,
     key: (u32, u32),
     incoming: Point,
-    aggregation: Aggregation,
+    aggregation: Reducer,
     band_count: usize,
 ) {
     use std::collections::hash_map::Entry;
@@ -209,7 +191,7 @@ fn merge_point(
         Entry::Occupied(mut entry) => {
             let point = entry.get_mut();
             match aggregation {
-                Aggregation::Max => {
+                Reducer::Max | Reducer::Mean | Reducer::Percentile(_) => {
                     for index in 0..band_count {
                         if let Some(value) = incoming.values[index].get() {
                             point.values[index] = CompactOptI32::new(Some(
@@ -218,7 +200,7 @@ fn merge_point(
                         }
                     }
                 }
-                Aggregation::Min => {
+                Reducer::Min => {
                     for index in 0..band_count {
                         if let Some(value) = incoming.values[index].get() {
                             point.values[index] = CompactOptI32::new(Some(
@@ -227,16 +209,7 @@ fn merge_point(
                         }
                     }
                 }
-                Aggregation::RoughAvg => {
-                    for index in 0..band_count {
-                        if let Some(value) = incoming.values[index].get() {
-                            point.values[index] =
-                                CompactOptI32::new(Some(point.values[index].unwrap_or(0) + value));
-                        }
-                        point.counts[index] += incoming.counts[index];
-                    }
-                }
-                Aggregation::BitOr => {
+                Reducer::BitOr => {
                     for index in 0..band_count {
                         if let Some(value) = incoming.values[index].get() {
                             point.values[index] =
@@ -587,10 +560,7 @@ pub(crate) fn make_layer(
     // A weighted statistic of a block that is a single cell is that cell's
     // value, and the cells of a tile do not overlap, so where nothing is
     // merged the maximum gives the same answer without weighing anything.
-    let aggregation = match product.spec.reducer {
-        Reducer::Legacy(aggregation) => aggregation,
-        _ => Aggregation::Max,
-    };
+    let aggregation = product.spec.reducer;
     let band_count = product.spec.band_specs.len();
     let grid = &product.spec.grid_spec;
 
@@ -627,20 +597,14 @@ pub(crate) fn make_layer(
             }
 
             let mut values = [CompactOptI32::NONE; 4];
-            let mut counts = [0; 4];
             for (band_index, band) in tile.bands.iter().enumerate() {
-                (values[band_index], counts[band_index]) =
-                    aggregate_band(&band.values[group_begin..end], aggregation);
+                values[band_index] = aggregate_band(&band.values[group_begin..end], aggregation);
             }
 
             merge_point(
                 points,
                 (grid_x, grid_y),
-                Point {
-                    values,
-                    counts,
-                    power,
-                },
+                Point { values, power },
                 aggregation,
                 band_count,
             );
@@ -673,15 +637,6 @@ pub(crate) fn make_layer(
     };
     if points.is_empty() {
         return Ok(None);
-    }
-
-    if aggregation == Aggregation::RoughAvg {
-        for point in points.values_mut() {
-            for index in 0..band_count {
-                point.values[index] = point.values[index]
-                    .map(|value| CompactOptI32::new(Some(value / point.counts[index])));
-            }
-        }
     }
 
     // `--omit-zero` means physical zero, independently of any representative
@@ -1135,7 +1090,7 @@ mod tests {
             ("min", Some(3)),
             ("mean", None),
             ("mean", Some(0)),
-            ("rough-avg", None),
+            ("avg", None),
             ("bit-or", Some(64)),
         ] {
             compared += pyramid_matches_cells(reducer, fill);
@@ -1361,76 +1316,29 @@ mod tests {
     }
 
     #[test]
-    fn rough_avg_aggregates_sum_and_count_in_one_pass() {
-        let values = [value(7), CompactOptI32::NONE, value(-2), value(5)];
-
-        let (sum, count) = aggregate_band(&values, Aggregation::RoughAvg);
-
-        assert_eq!(sum, value(10));
-        assert_eq!(count, 3);
-    }
-
-    #[test]
-    fn non_average_aggregations_do_not_track_counts() {
+    fn source_cell_values_skip_missing_samples() {
         let values = [value(6), CompactOptI32::NONE, value(3)];
 
-        for (aggregation, expected) in [
-            (Aggregation::Max, 6),
-            (Aggregation::Min, 3),
-            (Aggregation::BitOr, 7),
-        ] {
-            let (aggregated, count) = aggregate_band(&values, aggregation);
+        for (aggregation, expected) in [(Reducer::Max, 6), (Reducer::Min, 3), (Reducer::BitOr, 7)] {
+            let aggregated = aggregate_band(&values, aggregation);
             assert_eq!(aggregated, value(expected));
-            assert_eq!(count, 0);
         }
     }
 
     #[test]
-    fn merge_only_updates_active_bands() {
-        let key = (1, 2);
-        let mut points = PointMap::default();
-        points.insert(
-            key,
-            Point {
-                values: [value(10), value(20), value(30), value(40)],
-                counts: [1, 2, 3, 4],
-                power: 1,
-            },
-        );
-
-        merge_point(
-            &mut points,
-            key,
-            Point {
-                values: [value(5), value(7), value(11), value(13)],
-                counts: [5, 6, 7, 8],
-                power: 2,
-            },
-            Aggregation::RoughAvg,
-            2,
-        );
-
-        let point = &points[&key];
-        assert_eq!(point.values, [value(15), value(27), value(30), value(40)]);
-        assert_eq!(point.counts, [6, 8, 3, 4]);
-        assert_eq!(point.power, 2);
-    }
-
-    #[test]
-    fn non_average_merge_does_not_update_counts_or_trailing_bands() {
+    fn source_cell_merge_preserves_trailing_bands() {
         let key = (1, 2);
 
         for (aggregation, expected) in [
-            (Aggregation::Max, [value(10), value(20)]),
-            (Aggregation::Min, [value(5), value(7)]),
-            (Aggregation::BitOr, [value(15), value(23)]),
+            (Reducer::Max, [value(10), value(20)]),
+            (Reducer::Min, [value(5), value(7)]),
+            (Reducer::BitOr, [value(15), value(23)]),
         ] {
             let mut points = PointMap::default();
             points.insert(
                 key,
                 Point {
                     values: [value(10), value(20), value(30), value(40)],
-                    counts: [1, 2, 3, 4],
                     power: 1,
                 },
             );
@@ -1440,7 +1348,6 @@ mod tests {
                 key,
                 Point {
                     values: [value(5), value(7), value(11), value(13)],
-                    counts: [5, 6, 7, 8],
                     power: 2,
                 },
                 aggregation,
@@ -1450,7 +1357,6 @@ mod tests {
             let point = &points[&key];
             assert_eq!(&point.values[..2], &expected);
             assert_eq!(&point.values[2..], &[value(30), value(40)]);
-            assert_eq!(point.counts, [1, 2, 3, 4]);
             assert_eq!(point.power, 2);
         }
     }
