@@ -51,18 +51,10 @@ struct Cli {
     #[arg(long, value_name = "PIXELS")]
     buffer: Option<u32>,
 
-    /// How coarsely MVT grid cells are merged at each zoom, as the log2 of the
-    /// resolution a merged block approaches: at 8 a block is about 1/256 of
-    /// the tile across, at 9 about 1/512. Give one value for every zoom, or
-    /// stops as <ZOOM>:<DETAIL>,... where each holds until the next, such as
-    /// 1:9,5:8,9:12. Blocks are a power of two cells across, so the size is
-    /// the nearest one to the request. Only values from 8 to 30 are accepted,
-    /// so blocks can be made finer than the default but not coarser. Raising
-    /// the detail stops short of blocks narrower than one unit of --extent,
-    /// which would round away with their value, so the extent limits how fine
-    /// a detail takes effect; at the default extent that is about detail 11.
-    /// The default blocks are kept as they are even when a small --extent
-    /// makes them narrower than a unit. [default: 8]
+    /// MVT pixels across a low-zoom tile, as log2: 8 means 256, 9 means 512.
+    /// Give one value for every zoom, or stops such as 1:9,5:8,9:12.
+    /// Accepts 7 through 12. Low zooms use one MVT unit per pixel; higher
+    /// zooms keep source cells at --extent. [default: 8]
     #[arg(long, value_name = "SPEC")]
     detail: Option<String>,
 
@@ -103,19 +95,49 @@ struct Cli {
     omit_class: Vec<String>,
 
     /// Before quantization, leave cells whose physical value is exactly zero
-    /// out of the tile on every band. Ignored by bands which cannot represent
-    /// zero.
+    /// out of the tile on every band. A band that cannot represent zero has no
+    /// cell to leave out, but a weighted mean of it can still come out at
+    /// zero, and is left out then.
     #[arg(long)]
     omit_zero: bool,
 
-    /// Write RGBA raster tiles instead of MVT, encoding band values into the
-    /// colour channels so that a shader can read them back.
+    /// Override how cells are combined into a low-zoom pixel: max, min,
+    /// mean, bit-or or p<percent>. Mean and percentiles weigh each cell by
+    /// its area on the grid:
+    ///
+    ///   mean (avg)  the grid-area-weighted mean; vector raw values round half to even
+    ///   p<percent>    the smallest value covering at least that share of
+    ///                 the pixel, without interpolation, such as p95 or p99.5
+    ///
+    /// Weighted statistics fill unstored cells with zero for precipitation
+    /// and snow, and exclude them otherwise. Override with --missing or --fill.
+    #[arg(long, value_name = "METHOD", verbatim_doc_comment)]
+    aggregation: Option<String>,
+
+    /// Physical value counted over the part of a pixel no cell is stored for,
+    /// for mean or p<percent>, including a product's default mean, overriding
+    /// --missing for a band.
+    /// Precipitation and snow already default to zero fill. The value must be one
+    /// the band can hold exactly. Prefix with a band name when the product has
+    /// several bands, and repeat as needed. A pixel with no stored cell stays
+    /// empty.
+    #[arg(long, value_name = "VALUE")]
+    fill: Vec<String>,
+
+    /// Weighted statistics: exclude missing cells or fill with a physical value.
+    /// Defaults to zero for precipitation/snow, exclusion for other products.
+    #[arg(long, value_name = "POLICY", allow_hyphen_values = true)]
+    missing: Option<String>,
+
+    /// Write RGBA PNG raster tiles instead of MVT. Choose classified display
+    /// colours, or encode values into channels for decoding by a shader.
     ///
     /// The parameters belong to the archive rather than to a tile, so that
     /// every tile decodes the same way and the field does not jump at a seam.
     /// The channels, offset, scale and mask needed to decode them are recorded
     /// as structured archive metadata.
     ///
+    ///   classified                  display colours supplied by --color-map.
     ///   vector-field:<component-limit>
     ///                               two bands (u, v) for a particle layer.
     ///                               Signed-normalised into red and green with
@@ -136,6 +158,20 @@ struct Cli {
     /// replaced, and timestamps use UTC YYYYMMDDHHMMSS.
     #[arg(long, value_name = "SPEC", verbatim_doc_comment)]
     raster: Option<String>,
+
+    /// Fixed display colours, with inclusive lower bounds: 0:#00000000,1:#00aaff.
+    /// Accepts #RRGGBB or #RRGGBBAA, or @FILE.json with per-class opacity.
+    /// Requires --raster classified. Missing
+    /// values and values below the first bound are transparent.
+    #[arg(long, value_name = "STOPS", allow_hyphen_values = true)]
+    color_map: Option<String>,
+
+    /// Pixels across a --raster tile, 256 or 512. A 256-pixel tile at zoom
+    /// z + 1 holds the same pixels as a quarter of a 512-pixel one at z, so
+    /// the default maximum zoom is one higher and every zoom is merged as the
+    /// larger tile one zoom out would be. [default: 512]
+    #[arg(long, value_name = "PIXELS")]
+    raster_size: Option<u32>,
 
     /// Write an index of the archives --raster produced to this path.
     ///
@@ -164,10 +200,15 @@ fn main() -> Result<()> {
             quantize: cli.quantize,
             omit_class: cli.omit_class,
             omit_zero: cli.omit_zero,
+            aggregation: cli.aggregation,
+            fill: cli.fill,
+            missing: cli.missing,
             extent: cli.extent,
             buffer: cli.buffer,
             detail: cli.detail,
             raster: cli.raster,
+            color_map: cli.color_map,
+            raster_size: cli.raster_size,
             manifest: cli.manifest,
             skip_analysis: cli.skip_analysis,
             min_lead_time: cli.min_lead_time,

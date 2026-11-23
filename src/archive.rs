@@ -18,8 +18,8 @@ use crate::{
     model::PreparedProduct,
     prepare, quantize,
     tile::{
-        ColorEncoding, DetailSchedule, MvtLayout, TileContext, TileOutput, Zxy, make_layer,
-        zxy_to_chunk_id_range,
+        ColorEncoding, ColorMap, DetailSchedule, MvtLayout, RASTER_TILE_SIZES, RasterLayout,
+        Reducer, TileContext, TileOutput, Zxy, make_layer, zxy_to_chunk_id_range,
     },
 };
 
@@ -40,16 +40,28 @@ pub struct ConvertOptions {
     pub omit_class: Vec<String>,
     /// Leave out cells whose physical value is zero before quantization.
     pub omit_zero: bool,
+    /// How cells are combined into the pixels of a low zoom, overriding the
+    /// product's own aggregation; see [`crate::tile::Reducer`].
+    pub aggregation: Option<String>,
+    /// Physical value counted over the part of a pixel no cell is stored for,
+    /// as `[<band>=]<value>`. Needs a weighted aggregation, explicit or default.
+    pub fill: Vec<String>,
+    /// Missing-cell policy for weighted statistics: exclude or a physical fill value.
+    pub missing: Option<String>,
     /// MVT tile extent. Defaults to 4096.
     pub extent: Option<u32>,
     /// MVT geometry kept beyond each tile edge, in 1/256ths of the tile width.
     /// Defaults to 2.
     pub buffer: Option<u32>,
-    /// How coarsely cells are merged at each zoom, as `<detail>` or
+    /// Log2 of lattice pixels across an MVT tile (7 through 12), as `<detail>` or
     /// `<zoom>:<detail>,...`. Defaults to 8 at every zoom.
     pub detail: Option<String>,
     /// Emit RGBA raster tiles with this colour encoding instead of MVT.
     pub raster: Option<String>,
+    /// Fixed display colours: <lower>:#RRGGBB[AA],...; requires --raster classified.
+    pub color_map: Option<String>,
+    /// Pixels across a raster tile, 256 or 512. Defaults to 512.
+    pub raster_size: Option<u32>,
     /// Write an index of the raster archives to this path.
     pub manifest: Option<PathBuf>,
     /// Drop products whose generating process is an analysis rather than a forecast.
@@ -71,10 +83,15 @@ impl Default for ConvertOptions {
             quantize: Vec::new(),
             omit_class: Vec::new(),
             omit_zero: false,
+            aggregation: None,
+            fill: Vec::new(),
+            missing: None,
             extent: None,
             buffer: None,
             detail: None,
             raster: None,
+            color_map: None,
+            raster_size: None,
             manifest: None,
             skip_analysis: false,
             min_lead_time: None,
@@ -112,7 +129,7 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
         options.skip_analysis,
         options.min_lead_time,
     )?;
-    let mut products = prepare::prepare_products(products);
+    let mut products = prepare_selected_products(products, options.aggregation.as_deref())?;
     let layer_names = build_layer_names(options, products.len())?;
 
     ensure_compatible_products(&products)?;
@@ -123,6 +140,26 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
         &options.omit_class,
         options.omit_zero,
     )?;
+    apply_aggregation(
+        &mut products,
+        options.aggregation.as_deref(),
+        &options.fill,
+        options.missing.as_deref(),
+    )?;
+    let color_map = options
+        .color_map
+        .as_deref()
+        .map(str::parse::<ColorMap>)
+        .transpose()?;
+    for product in &mut products {
+        product.spec.color_map = color_map.clone();
+    }
+    let output_format = output_format(&products, options)?;
+    // A smaller raster tile needs one more zoom to reach the same pixels.
+    let zoom_offset = match output_format {
+        TileOutput::Raster(layout) => layout.zoom_offset(),
+        TileOutput::Mvt(_) => 0,
+    };
     let max_zoom = options.max_zoom.unwrap_or_else(|| {
         products
             .iter()
@@ -130,6 +167,7 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
                 (product.spec.grid_spec.lat_denom * 360.0 * 2.0 / 512.0)
                     .log2()
                     .round() as u8
+                    + zoom_offset
             })
             .max()
             .unwrap_or(options.min_zoom)
@@ -140,35 +178,14 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
         options.min_zoom
     );
 
-    let output_format = match &options.raster {
-        Some(spec) => {
-            let encoding = spec.parse::<ColorEncoding>()?;
-            encoding.check_bands(
-                &products[0]
-                    .spec
-                    .band_specs
-                    .iter()
-                    .map(|band| band.name.clone())
-                    .collect::<Vec<_>>(),
-            )?;
-            TileOutput::Raster(encoding)
-        }
-        None => {
-            let default = MvtLayout::default();
-            TileOutput::Mvt(MvtLayout {
-                extent: options.extent.unwrap_or(default.extent),
-                buffer: options.buffer.unwrap_or(default.buffer),
-                detail: match &options.detail {
-                    Some(spec) => spec.parse::<DetailSchedule>()?,
-                    None => default.detail,
-                },
-            })
-        }
-    };
-
     match output_format {
         TileOutput::Mvt(_) => {
             ensure_distinct_paths(input, &[output.to_path_buf()], None)?;
+            // Every layer of a vector tile is drawn together, so every
+            // product needs its pyramid at once.
+            products.par_iter_mut().for_each(|product| {
+                build_pyramid(product, options.min_zoom, max_zoom, output_format);
+            });
             write_archive(
                 output,
                 &products,
@@ -183,11 +200,14 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
             let outputs = raster_output_paths(output, &products, options.layer_seq_start)?;
             ensure_distinct_paths(input, &outputs, options.manifest.as_deref())?;
             for (index, ((product, layer_name), output)) in products
-                .iter()
+                .iter_mut()
                 .zip(&layer_names)
                 .zip(outputs.iter())
                 .enumerate()
             {
+                // A raster archive holds one product, so its pyramid lives
+                // only as long as the archive is written.
+                build_pyramid(product, options.min_zoom, max_zoom, output_format);
                 write_archive(
                     output,
                     std::slice::from_ref(product),
@@ -197,6 +217,7 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
                     output_format,
                     Some(options.layer_seq_start + index),
                 )?;
+                product.pyramid = None;
             }
             if let Some(manifest) = &options.manifest {
                 write_manifest(
@@ -211,6 +232,43 @@ pub fn convert(input: &Path, output: &Path, options: &ConvertOptions) -> Result<
             Ok(())
         }
     }
+}
+
+/// Validate source-cell area for both explicit and product-default statistics.
+pub(crate) fn prepare_selected_products(
+    products: Vec<prepare::RawProduct>,
+    aggregation: Option<&str>,
+) -> Result<Vec<PreparedProduct>> {
+    let reducer = aggregation.map(str::parse::<Reducer>).transpose()?;
+    let strict = reducer.map_or_else(
+        || {
+            products
+                .iter()
+                .any(|p| Reducer::from(p.product_id.aggregation()).is_weighted())
+        },
+        Reducer::is_weighted,
+    );
+    prepare::prepare_products(products, strict)
+}
+
+/// Builds the pyramid a product's lattice zooms read, if it has any and its
+/// statistic merges; see [`crate::tile::Pyramid`].
+pub(crate) fn build_pyramid(
+    product: &mut PreparedProduct,
+    min_zoom: u8,
+    max_zoom: u8,
+    output: TileOutput,
+) {
+    let levels = (min_zoom..=max_zoom)
+        .filter_map(|zoom| crate::tile::lattice_level(product, zoom, output))
+        .collect::<Vec<_>>();
+    let (Some(&coarsest), Some(&finest)) = (levels.iter().min(), levels.iter().max()) else {
+        return;
+    };
+    let every_band = matches!(output, TileOutput::Raster(_));
+    product.pyramid = Some(crate::tile::Pyramid::build(
+        product, coarsest, finest, every_band,
+    ));
 }
 
 /// Expands a raster output pattern into one archive path per forecast time.
@@ -349,14 +407,14 @@ fn write_manifest(
             });
             // The extremes belong to one forecast time rather than to the set:
             // a later hour can hold a jet the first one did not.
-            if let (Some(entry), TileOutput::Raster(encoding)) =
+            if let (Some(entry), TileOutput::Raster(layout)) =
                 (entry.as_object_mut(), output_format)
             {
                 entry.insert(
                     "source_range".into(),
                     metadata::range_report(
-                        &crate::tile::inspect_raster_range(product, encoding),
-                        encoding,
+                        &crate::tile::inspect_raster_range(product, layout.encoding),
+                        layout.encoding,
                     ),
                 );
             }
@@ -369,7 +427,7 @@ fn write_manifest(
         // two times sets up its decode and its texture coordinates before it
         // opens any archive, and having to open one to find the rest is exactly
         // what the manifest is for avoiding.
-        TileOutput::Raster(encoding) => metadata::raster_encoding(products.first(), encoding),
+        TileOutput::Raster(layout) => metadata::raster_encoding(products.first(), layout),
         TileOutput::Mvt(_) => serde_json::Value::Null,
     };
     let manifest = serde_json::json!({
@@ -463,13 +521,13 @@ fn write_archive(
     // Measured over the source once, before any tile is written: saturation is
     // invisible in the output, so it has to be reported from the input.
     let range = match output_format {
-        TileOutput::Raster(encoding) => products.first().map(|product| {
-            let report = crate::tile::inspect_raster_range(product, encoding);
+        TileOutput::Raster(layout) => products.first().map(|product| {
+            let report = crate::tile::inspect_raster_range(product, layout.encoding);
             if report.is_clipping() {
                 let extremes = report
                     .extremes
                     .iter()
-                    .take(encoding.bands())
+                    .take(layout.encoding.bands())
                     .flatten()
                     .map(|(low, high)| format!("{low:.3}..{high:.3}"))
                     .collect::<Vec<_>>()
@@ -643,6 +701,14 @@ fn validate_options(options: &ConvertOptions) -> Result<()> {
     if let Some(spec) = &options.raster {
         spec.parse::<ColorEncoding>()?;
     }
+    let classified = options.raster.as_deref() == Some("classified");
+    ensure!(
+        classified == options.color_map.is_some(),
+        "--raster classified requires --color-map; --color-map only applies to classified output"
+    );
+    if let Some(map) = &options.color_map {
+        map.parse::<ColorMap>()?;
+    }
     if let Some(extent) = options.extent {
         ensure!(
             (1..=MAX_MVT_EXTENT).contains(&extent),
@@ -663,12 +729,159 @@ fn validate_options(options: &ConvertOptions) -> Result<()> {
             || (options.extent.is_none() && options.buffer.is_none() && options.detail.is_none()),
         "--extent, --buffer and --detail apply to MVT output, not to --raster"
     );
+    if let Some(size) = options.raster_size {
+        ensure!(
+            options.raster.is_some(),
+            "--raster-size sets the size of the tiles --raster writes, so it needs --raster as well"
+        );
+        ensure!(
+            RASTER_TILE_SIZES.contains(&size),
+            "--raster-size must be one of {RASTER_TILE_SIZES:?}"
+        );
+    }
     ensure!(
         options.manifest.is_none() || options.raster.is_some(),
         "--manifest indexes the archives --raster produces, so it needs --raster as well"
     );
     quantize::validate_syntax(&options.quantize)?;
     quantize::validate_omit_class_syntax(&options.omit_class)?;
+    let reducer = options
+        .aggregation
+        .as_deref()
+        .map(str::parse::<Reducer>)
+        .transpose()?;
+    ensure!(
+        options.fill.is_empty() || reducer.is_none_or(Reducer::is_weighted),
+        "--fill counts the area no cell covers, which only --aggregation mean or p<percent> weigh"
+    );
+    quantize::validate_fill_syntax(&options.fill)?;
+    if let Some(missing) = &options.missing {
+        ensure!(
+            reducer.is_none_or(Reducer::is_weighted),
+            "--missing requires --aggregation mean or p<percent>"
+        );
+        if missing != "exclude" {
+            quantize::validate_fill_syntax(std::slice::from_ref(missing))?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether a product's unstored cells read as zero.
+///
+/// Only where decoding drops a zero that means none: rain or snow that did not
+/// fall. Every other product stores its zeros, so what it leaves unstored is
+/// missing or outside its grid, and counting that as zero would drag a block
+/// at the edge of a model domain towards it.
+fn default_zero_fill(kind: gpv_products::products::GpvProductElement) -> bool {
+    use gpv_products::products::GpvProductElement::*;
+    matches!(
+        kind,
+        BunpuPrecipitation
+            | BunpuSnowfall
+            | HiresNowcastIntensity
+            | HiresNowcastPrecip
+            | Precipitaiton
+            | Precipitaiton15h
+            | SnowDepth
+            | Snowfall
+    )
+}
+
+/// What the tiles are written as: raster images when `--raster` is given,
+/// MVT otherwise.
+fn output_format(products: &[PreparedProduct], options: &ConvertOptions) -> Result<TileOutput> {
+    Ok(match &options.raster {
+        Some(spec) => {
+            let encoding = spec.parse::<ColorEncoding>()?;
+            encoding.check_bands(
+                &products[0]
+                    .spec
+                    .band_specs
+                    .iter()
+                    .map(|band| band.name.clone())
+                    .collect::<Vec<_>>(),
+            )?;
+            let mut layout = RasterLayout::new(encoding);
+            if let Some(size) = options.raster_size {
+                layout.size = size;
+            }
+            TileOutput::Raster(layout)
+        }
+        None => {
+            let default = MvtLayout::default();
+            TileOutput::Mvt(MvtLayout {
+                extent: options.extent.unwrap_or(default.extent),
+                buffer: options.buffer.unwrap_or(default.buffer),
+                detail: match &options.detail {
+                    Some(spec) => spec.parse::<DetailSchedule>()?,
+                    None => default.detail,
+                },
+            })
+        }
+    })
+}
+
+/// Chooses how each product's cells are combined, and resolves the fill
+/// against every forecast time's own band spec for the reason
+/// [`apply_quantization`] gives.
+fn apply_aggregation(
+    products: &mut [PreparedProduct],
+    aggregation: Option<&str>,
+    fill: &[String],
+    missing: Option<&str>,
+) -> Result<()> {
+    let override_reducer = aggregation.map(str::parse::<Reducer>).transpose()?;
+    for (index, product) in products.iter_mut().enumerate() {
+        let reducer =
+            override_reducer.unwrap_or_else(|| Reducer::from(product.product_id.aggregation()));
+        ensure!(
+            reducer.is_weighted() || (fill.is_empty() && missing.is_none()),
+            "--fill and --missing require mean or p<percent>; {} uses {}",
+            product.product_id.path(),
+            reducer.name()
+        );
+        product.spec.reducer = reducer;
+        if matches!(reducer, Reducer::Percentile(_)) {
+            use gpv_products::products::GpvProductElement::*;
+            ensure!(
+                product.spec.band_specs.len() == 1
+                    && !matches!(
+                        product.product_id.kind,
+                        BunpuWeather | SuikeiWeather | HiresCloudType | HiresCloudQc
+                    ),
+                "percentiles require an ordered scalar, not vector components or nominal codes"
+            );
+        }
+        let default = missing
+            .map(str::to_owned)
+            .or_else(|| default_zero_fill(product.product_id.kind).then(|| "0".into()));
+        product.spec.fill = if reducer.is_weighted() {
+            match default.as_deref() {
+                None | Some("exclude") => vec![None; product.spec.band_specs.len()],
+                Some(value) => quantize::resolve_fill(
+                    &product
+                        .spec
+                        .band_specs
+                        .iter()
+                        .map(|b| format!("{}={value}", b.name))
+                        .collect::<Vec<_>>(),
+                    &product.spec.band_specs,
+                )?,
+            }
+        } else {
+            vec![None; product.spec.band_specs.len()]
+        };
+        let overrides = quantize::resolve_fill(fill, &product.spec.band_specs)?;
+        for (target, value) in product.spec.fill.iter_mut().zip(overrides) {
+            if value.is_some() {
+                *target = value;
+            }
+        }
+        if index == 0 {
+            info!(aggregation = %reducer.name(), "combining cells");
+        }
+    }
     Ok(())
 }
 
@@ -772,7 +985,10 @@ fn apply_quantization(
                         "quantizing values"
                     );
                 }
-                if zero_omits[band_index].is_some() {
+                if zero_omits[band_index]
+                    .as_ref()
+                    .is_some_and(|omit| omit.has_stored())
+                {
                     info!(band = %band.name, "omitting physical zero before quantization");
                 }
                 if let Some(omit) = &class_omits[band_index] {
@@ -1006,17 +1222,28 @@ fn traverse_tile_pyramid(
     }
 
     let (z, x, y) = zxy;
-    if z >= min_zoom {
-        let tile_context = TileContext::new(zxy);
-        let layers = products
-            .par_iter()
-            .zip(layer_names.par_iter())
-            .map(|(product, layer_name)| make_layer(&tile_context, product, layer_name, output))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        if !layers.is_empty() {
+    // A tile and the pyramid below it are independent, so they run side by
+    // side. Waiting for the tile first left every thread but one idle while a
+    // low zoom gathered the cells of the whole grid, one zoom after another.
+    // Tiles are sorted before they are written, so the order they finish in
+    // does not reach the archive.
+    let (tile, children) = rayon::join(
+        || -> Result<()> {
+            if z < min_zoom {
+                return Ok(());
+            }
+            let tile_context = TileContext::new(zxy);
+            let layers = products
+                .par_iter()
+                .zip(layer_names.par_iter())
+                .map(|(product, layer_name)| make_layer(&tile_context, product, layer_name, output))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            if layers.is_empty() {
+                return Ok(());
+            }
             let tile = match output {
                 // MVT layers concatenate into one tile, and the archive stores
                 // them gzipped.
@@ -1025,8 +1252,10 @@ fn traverse_tile_pyramid(
                     for layer in layers {
                         protobuf.extend_from_slice(&layer);
                     }
+                    // Level 7 keeps most of what 9 saves over the default 6
+                    // (about 3% of the archive) for a fraction of its time.
                     let mut encoder =
-                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(7));
                     encoder.write_all(&protobuf)?;
                     encoder.finish()?
                 }
@@ -1039,26 +1268,30 @@ fn traverse_tile_pyramid(
             };
             sender
                 .send((zxy, tile))
-                .map_err(|_| anyhow::anyhow!("PMTiles writer stopped before tile generation"))?;
-        }
-    }
-
-    if z < max_zoom {
-        [(0, 0), (1, 0), (0, 1), (1, 1)]
-            .par_iter()
-            .try_for_each(|(dx, dy)| {
-                traverse_tile_pyramid(
-                    (z + 1, x * 2 + dx, y * 2 + dy),
-                    products,
-                    layer_names,
-                    min_zoom,
-                    max_zoom,
-                    output,
-                    sender,
-                )?;
-                Ok::<_, anyhow::Error>(())
-            })?;
-    }
+                .map_err(|_| anyhow::anyhow!("PMTiles writer stopped before tile generation"))
+        },
+        || -> Result<()> {
+            if z >= max_zoom {
+                return Ok(());
+            }
+            [(0, 0), (1, 0), (0, 1), (1, 1)]
+                .par_iter()
+                .try_for_each(|(dx, dy)| {
+                    traverse_tile_pyramid(
+                        (z + 1, x * 2 + dx, y * 2 + dy),
+                        products,
+                        layer_names,
+                        min_zoom,
+                        max_zoom,
+                        output,
+                        sender,
+                    )?;
+                    Ok::<_, anyhow::Error>(())
+                })
+        },
+    );
+    tile?;
+    children?;
     Ok(true)
 }
 
@@ -1241,7 +1474,10 @@ mod tests {
             metadata::MetadataOptions {
                 min_zoom: 0,
                 max_zoom: 0,
-                output: TileOutput::Raster(ColorEncoding::Scalar16 { min: 0.0, max: 1.0 }),
+                output: TileOutput::Raster(RasterLayout::new(ColorEncoding::Scalar16 {
+                    min: 0.0,
+                    max: 1.0,
+                })),
                 sequence: None,
                 range: None,
             },
@@ -1413,6 +1649,37 @@ mod tests {
     }
 
     #[test]
+    fn display_map_requires_classified_raster_and_valid_colours() {
+        for (raster, map, valid) in [
+            (Some("classified"), Some("0:#00000000,1:#00aaff"), true),
+            (Some("classified"), None, false),
+            (None, Some("0:#ffffff"), false),
+            (Some("scalar16:0,100"), Some("0:#ffffff"), false),
+            (Some("classified"), Some("0:#xyzxyz"), false),
+        ] {
+            assert_eq!(
+                validate_options(&ConvertOptions {
+                    raster: raster.map(str::to_owned),
+                    color_map: map.map(str::to_owned),
+                    ..Default::default()
+                })
+                .is_ok(),
+                valid
+            );
+        }
+        assert!(
+            ColorEncoding::Classified
+                .check_bands(&["rain".into()])
+                .is_ok()
+        );
+        assert!(
+            ColorEncoding::Classified
+                .check_bands(&["u".into(), "v".into()])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn extent_and_buffer_are_bounded() {
         for (extent, buffer) in [
             (Some(0), None),
@@ -1488,7 +1755,7 @@ mod tests {
 
     fn product(minutes: i64, process: GeneratingProcessType) -> PreparedProduct {
         use gpv_products::{
-            model::{Aggregation, LngLatGrid},
+            model::LngLatGrid,
             products::{GpvProductElement, GpvProductIdentifier},
         };
         use jiff::Timestamp;
@@ -1505,13 +1772,15 @@ mod tests {
             spec: crate::model::TilesetSpec {
                 name: product_id.path(),
                 base_z: 0,
+                color_map: None,
                 grid_spec: LngLatGrid {
                     lng_0: 0.0,
                     lat_0: 0.0,
                     lng_denom: 1.0,
                     lat_denom: 1.0,
                 },
-                aggregation: Aggregation::Max,
+                reducer: crate::tile::Reducer::Max,
+                fill: Vec::new(),
                 band_specs: Vec::new(),
                 quantize: Vec::new(),
                 omit_zero: Vec::new(),
@@ -1520,6 +1789,172 @@ mod tests {
             },
             product_id,
             chunks: Vec::new(),
+            pyramid: None,
+        }
+    }
+
+    #[test]
+    fn default_mean_and_aliases_share_missing_policy_and_metadata() {
+        use gpv_products::{model::BandSpec, products::GpvProductElement};
+        for kind in [
+            GpvProductElement::GsmTemperature,
+            GpvProductElement::GsmPrecipitation,
+        ] {
+            let mut expected = None;
+            for method in [None, Some("mean"), Some("avg")] {
+                let mut products = [product(0, GeneratingProcessType::Forecast)];
+                products[0].product_id.kind = kind;
+                products[0].spec.band_specs = vec![BandSpec {
+                    name: "value".into(),
+                    ..Default::default()
+                }];
+                apply_aggregation(&mut products, method, &[], None).unwrap();
+                assert_eq!(products[0].spec.reducer, Reducer::Mean);
+                assert_eq!(
+                    products[0].spec.fill,
+                    vec![if default_zero_fill(kind) {
+                        Some(0)
+                    } else {
+                        None
+                    }]
+                );
+                let actual = metadata::generate_metadata(
+                    "mean",
+                    &products,
+                    &["value".into()],
+                    [0.0; 4],
+                    metadata::MetadataOptions {
+                        min_zoom: 0,
+                        max_zoom: 1,
+                        output: TileOutput::Mvt(MvtLayout::default()),
+                        sequence: None,
+                        range: None,
+                    },
+                );
+                // Same explicit statistic and default statistic must describe the same tiles.
+                let descriptor = actual.get("aggregation").unwrap().clone();
+                assert_eq!(descriptor["method"], "mean");
+                if let Some(expected) = &expected {
+                    assert_eq!(&descriptor, expected);
+                } else {
+                    expected = Some(descriptor);
+                }
+                apply_aggregation(&mut products, method, &["value=5".into()], Some("exclude"))
+                    .unwrap();
+                assert_eq!(products[0].spec.fill, vec![Some(5)]);
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_missing_policy_checks_the_product_default() {
+        use gpv_products::{model::BandSpec, products::GpvProductElement};
+        let options = ConvertOptions {
+            missing: Some("0".into()),
+            ..Default::default()
+        };
+        validate_options(&options).unwrap();
+        let mut products = [product(0, GeneratingProcessType::Forecast)];
+        products[0].spec.band_specs = vec![BandSpec {
+            name: "value".into(),
+            ..Default::default()
+        }];
+        assert!(apply_aggregation(&mut products, None, &[], options.missing.as_deref()).is_err());
+        assert!(apply_aggregation(&mut products, None, &["1".into()], None).is_err());
+        products[0].product_id.kind = GpvProductElement::GsmTemperature;
+        apply_aggregation(&mut products, None, &[], options.missing.as_deref()).unwrap();
+        assert_eq!(products[0].spec.fill, vec![Some(0)]);
+    }
+
+    #[test]
+    fn weighted_missing_defaults_and_physical_overrides() {
+        use gpv_products::{model::BandSpec, products::GpvProductElement};
+        let mut products = [product(0, GeneratingProcessType::Forecast)];
+        products[0].spec.band_specs = vec![BandSpec {
+            name: "value".into(),
+            reference_value: -10.0,
+            binary_scale: -1,
+            ..Default::default()
+        }];
+        apply_aggregation(&mut products, Some("p95"), &[], None).unwrap();
+        assert_eq!(products[0].spec.fill, vec![Some(20)]);
+        apply_aggregation(&mut products, Some("mean"), &[], Some("exclude")).unwrap();
+        assert_eq!(products[0].spec.fill, vec![None]);
+        apply_aggregation(&mut products, Some("avg"), &["value=2".into()], Some("0")).unwrap();
+        assert_eq!(products[0].spec.fill, vec![Some(24)]);
+        assert!(apply_aggregation(&mut products, Some("mean"), &[], Some("0.1")).is_err());
+        for kind in [
+            GpvProductElement::NowcastEchoTops,
+            GpvProductElement::CwmWave,
+            // Model precipitation stores its zeros; what it leaves out is
+            // outside the domain, not dry.
+            GpvProductElement::MsmPrecipitation,
+            GpvProductElement::GsmPrecipitation,
+        ] {
+            products[0].product_id.kind = kind;
+            apply_aggregation(&mut products, Some("mean"), &[], None).unwrap();
+            assert_eq!(products[0].spec.fill, vec![None]);
+        }
+        products[0].product_id.kind = GpvProductElement::BunpuWeather;
+        assert!(apply_aggregation(&mut products, Some("p95"), &[], None).is_err());
+        products[0].product_id.kind = GpvProductElement::GsmWind;
+        products[0].spec.band_specs.push(BandSpec {
+            name: "v".into(),
+            ..Default::default()
+        });
+        assert!(apply_aggregation(&mut products, Some("p95"), &[], None).is_err());
+    }
+
+    /// The zero fill stands in for the zeros decoding dropped, so every
+    /// product it is the default for has to be one that drops them.
+    #[test]
+    fn zero_fill_defaults_only_where_decoding_drops_zero() {
+        use gpv_products::products::{GpvProductElement::*, GpvProductIdentifier};
+        for kind in [
+            BunpuPrecipitation,
+            BunpuSnowfall,
+            HiresNowcastIntensity,
+            HiresNowcastPrecip,
+            Precipitaiton,
+            Precipitaiton15h,
+            SnowDepth,
+            Snowfall,
+            GsmPrecipitation,
+            MsmPrecipitation,
+            LfmPrecipitation,
+            MepsPrecipitation,
+        ] {
+            let mut values = vec![0];
+            GpvProductIdentifier {
+                kind,
+                ..Default::default()
+            }
+            .translate_values(&mut values, 0);
+            assert_eq!(default_zero_fill(kind), values[0] == i32::MIN, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn missing_policy_requires_weighted_statistics() {
+        for method in [Some("max"), Some("min"), Some("bit-or")] {
+            assert!(
+                validate_options(&ConvertOptions {
+                    aggregation: method.map(str::to_owned),
+                    missing: Some("0".into()),
+                    ..Default::default()
+                })
+                .is_err()
+            );
+        }
+        for policy in ["exclude", "0", "-5"] {
+            assert!(
+                validate_options(&ConvertOptions {
+                    aggregation: Some("mean".into()),
+                    missing: Some(policy.into()),
+                    ..Default::default()
+                })
+                .is_ok()
+            );
         }
     }
 
@@ -1571,7 +2006,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let prepared = prepare::prepare_products(selected);
+        let prepared = prepare::prepare_products(selected, false).unwrap();
 
         assert_eq!(prepared.len(), 1);
         assert_eq!(

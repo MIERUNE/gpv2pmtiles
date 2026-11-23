@@ -1,19 +1,23 @@
+mod color_map;
 mod detail;
 mod mvt;
+mod pyramid;
 mod raster;
+mod reduce;
 
+pub(crate) use color_map::ColorMap;
 pub(crate) use detail::DetailSchedule;
+pub(crate) use pyramid::Pyramid;
+pub(crate) use reduce::Reducer;
 
 pub(crate) use raster::{
-    ColorEncoding, IMAGE_EXTENT as RASTER_IMAGE_EXTENT, RangeReport,
-    TILE_BUFFER as RASTER_TILE_BUFFER, TILE_EXTENT as RASTER_TILE_EXTENT,
+    ColorEncoding, RangeReport, RasterLayout, TILE_BUFFER as RASTER_TILE_BUFFER,
+    TILE_SIZES as RASTER_TILE_SIZES,
 };
 mod rect_union;
 
 use anyhow::Result;
 use fast_mvt::MvtValue;
-use gpv_products::model::Aggregation;
-use rayon::prelude::*;
 
 use fast_hilbert::xy2h;
 
@@ -69,7 +73,6 @@ impl TileContext {
 #[derive(Default, PartialEq, Eq, Debug, PartialOrd)]
 struct Point {
     values: [CompactOptI32; 4],
-    counts: [i32; 4],
     power: u8,
 }
 
@@ -162,39 +165,21 @@ impl BandScale<'_> {
 }
 
 #[inline]
-fn aggregate_band(values: &[CompactOptI32], aggregation: Aggregation) -> (CompactOptI32, i32) {
-    match aggregation {
-        Aggregation::Max => (CompactOptI32::new(values.iter().flatten().max()), 0),
-        Aggregation::Min => (CompactOptI32::new(values.iter().flatten().min()), 0),
-        Aggregation::RoughAvg => {
-            let mut sum = None;
-            let mut count = 0usize;
-            for value in values.iter().flatten() {
-                sum = Some(match sum {
-                    Some(sum) => sum + value,
-                    None => value,
-                });
-                count += 1;
-            }
-            (CompactOptI32::new(sum), count as i32)
-        }
-        Aggregation::BitOr => (
-            CompactOptI32::new(
-                values
-                    .iter()
-                    .flatten()
-                    .fold(None, |acc, value| Some(acc.unwrap_or(0) | value)),
-            ),
-            0,
-        ),
-    }
+fn aggregate_band(values: &[CompactOptI32], aggregation: Reducer) -> CompactOptI32 {
+    // This path only deduplicates copies of one source cell. A mean or
+    // percentile has the source value itself; strict preparation checked it.
+    CompactOptI32::new(match aggregation {
+        Reducer::Max | Reducer::Mean | Reducer::Percentile(_) => values.iter().flatten().max(),
+        Reducer::Min => values.iter().flatten().min(),
+        Reducer::BitOr => values.iter().flatten().reduce(|left, right| left | right),
+    })
 }
 
 fn merge_point(
     points: &mut PointMap<(u32, u32), Point>,
     key: (u32, u32),
     incoming: Point,
-    aggregation: Aggregation,
+    aggregation: Reducer,
     band_count: usize,
 ) {
     use std::collections::hash_map::Entry;
@@ -206,7 +191,7 @@ fn merge_point(
         Entry::Occupied(mut entry) => {
             let point = entry.get_mut();
             match aggregation {
-                Aggregation::Max => {
+                Reducer::Max | Reducer::Mean | Reducer::Percentile(_) => {
                     for index in 0..band_count {
                         if let Some(value) = incoming.values[index].get() {
                             point.values[index] = CompactOptI32::new(Some(
@@ -215,7 +200,7 @@ fn merge_point(
                         }
                     }
                 }
-                Aggregation::Min => {
+                Reducer::Min => {
                     for index in 0..band_count {
                         if let Some(value) = incoming.values[index].get() {
                             point.values[index] = CompactOptI32::new(Some(
@@ -224,16 +209,7 @@ fn merge_point(
                         }
                     }
                 }
-                Aggregation::RoughAvg => {
-                    for index in 0..band_count {
-                        if let Some(value) = incoming.values[index].get() {
-                            point.values[index] =
-                                CompactOptI32::new(Some(point.values[index].unwrap_or(0) + value));
-                        }
-                        point.counts[index] += incoming.counts[index];
-                    }
-                }
-                Aggregation::BitOr => {
+                Reducer::BitOr => {
                     for index in 0..band_count {
                         if let Some(value) = incoming.values[index].get() {
                             point.values[index] =
@@ -287,6 +263,92 @@ pub(crate) fn zxy_to_chunk_id_range(base_z: u8, zxy: Zxy) -> (u64, u64) {
         let begin = xy2h(x >> (z - base_z), y >> (z - base_z), base_z);
         (begin, begin + 1)
     }
+}
+
+/// The chunks a tile reads, as a rectangle of base-zoom tiles.
+///
+/// Longitude wraps, so the columns are a run that may cross the antimeridian:
+/// `columns` of them from `first_column`, modulo the width of the zoom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkSquare {
+    across: u32,
+    first_column: u32,
+    columns: u32,
+    rows: (u32, u32),
+}
+
+impl ChunkSquare {
+    /// The chunks [`source_chunks`] returns for a tile.
+    fn read_by(base_z: u8, zxy: Zxy, output: TileOutput) -> Self {
+        let (z, x, y) = zxy;
+        let across = 1u32 << base_z;
+        // A tile and its neighbours when the margin is read.
+        let reach = i64::from(matches!(output, TileOutput::Raster(_)));
+        let last_tile = (1i64 << z) - 1;
+        let (column_begin, column_end) = (i64::from(x) - reach, i64::from(x) + reach);
+        let (row_begin, row_end) = (
+            (i64::from(y) - reach).max(0),
+            (i64::from(y) + reach).min(last_tile),
+        );
+        // Tile edges at `z` in chunk units: below the base zoom a tile covers
+        // several chunks, above it a chunk covers several tiles.
+        let to_chunks = |begin: i64, end: i64| -> (i64, i64) {
+            if z <= base_z {
+                let shift = base_z - z;
+                (begin << shift, ((end + 1) << shift) - 1)
+            } else {
+                let shift = z - base_z;
+                (begin >> shift, end >> shift)
+            }
+        };
+        let (first, last) = to_chunks(column_begin, column_end);
+        let (top, bottom) = to_chunks(row_begin, row_end);
+        Self {
+            across,
+            first_column: first.rem_euclid(i64::from(across)) as u32,
+            columns: (last - first + 1).min(i64::from(across)) as u32,
+            rows: (top as u32, bottom as u32),
+        }
+    }
+
+    /// The chunk of this square nearest to `chunk`, which is `chunk` itself
+    /// when the square holds it.
+    ///
+    /// A cell's copies cover a rectangle of chunks around its own, so when its
+    /// own chunk lies outside the square, the nearest one inside is among the
+    /// copies the tile reads, and taking it keeps exactly one.
+    fn nearest(self, (column, row): (u32, u32)) -> (u32, u32) {
+        let offset = (column + self.across - self.first_column) % self.across;
+        let column = if offset < self.columns {
+            column
+        } else {
+            let past_end = offset - (self.columns - 1);
+            let before_start = self.across - offset;
+            if past_end < before_start {
+                (self.first_column + self.columns - 1) % self.across
+            } else {
+                self.first_column
+            }
+        };
+        (column, row.clamp(self.rows.0, self.rows.1))
+    }
+}
+
+fn owns_cell(
+    square: ChunkSquare,
+    (column, row): (u32, u32),
+    tile: &crate::model::BaseTile,
+    index: usize,
+) -> bool {
+    let (dx, dy) = tile.point_homes[index];
+    if (dx, dy) == (0, 0) {
+        return true;
+    }
+    let home = (
+        (i64::from(column) + i64::from(dx)).rem_euclid(i64::from(square.across)) as u32,
+        (i64::from(row) + i64::from(dy)) as u32,
+    );
+    square.nearest(home) == (column, row)
 }
 
 /// Measures a product's source values against the range an encoding can hold.
@@ -371,7 +433,7 @@ fn source_chunks(
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum TileOutput {
     Mvt(MvtLayout),
-    Raster(ColorEncoding),
+    Raster(RasterLayout),
 }
 
 /// The coordinate space of an MVT tile.
@@ -403,6 +465,34 @@ impl Default for MvtLayout {
 /// [`MvtLayout::buffer`].
 const CONTEXT_BUFFER: u32 = 2;
 
+/// The level `zoom + detail` a zoom aggregates its pixels at, or `None` for a
+/// zoom that draws source cells instead.
+///
+/// MVT takes the lattice at low zooms; a raster tile wherever a cell is finer than a
+/// pixel. A level is the number of pixels across the world as a power of two,
+/// so zooms whose details differ can share one.
+pub(crate) fn lattice_level(product: &PreparedProduct, zoom: u8, output: TileOutput) -> Option<u8> {
+    let grid = &product.spec.grid_spec;
+    match output {
+        TileOutput::Mvt(layout) => {
+            let maximum_detail_zoom = (grid.lat_denom * 360.0 * 2.0 / 512.0).log2().round() as u8;
+            let detail = layout.detail.at(zoom);
+            let lattice = detail::uses_lattice(
+                maximum_detail_zoom,
+                zoom,
+                detail,
+                (grid.lng_denom, grid.lat_denom),
+                layout.extent,
+            );
+            lattice.then_some(zoom + detail)
+        }
+        TileOutput::Raster(layout) => {
+            raster::uses_pixel_aggregation(&product.spec, (zoom, 0, 0), layout.size)
+                .then_some(zoom + layout.size.trailing_zeros() as u8)
+        }
+    }
+}
+
 pub(crate) fn make_layer(
     tile_context: &TileContext,
     product: &PreparedProduct,
@@ -415,10 +505,29 @@ pub(crate) fn make_layer(
         return Ok(None);
     }
     let chunks = source_chunks(product, tile_context.zxy, output);
-
-    let maximum_detail_zoom = (product.spec.grid_spec.lat_denom * 360.0 * 2.0 / 512.0)
-        .log2()
-        .round() as u8;
+    if let Some(level) = lattice_level(product, z, output) {
+        return reduce::with_workspace(|work| match output {
+            TileOutput::Mvt(layout) => mvt::render_lattice_layer(
+                layer_name,
+                product,
+                tile_context.zxy,
+                &chunks,
+                layout,
+                level,
+                &band_scales(product),
+                work,
+            ),
+            TileOutput::Raster(layout) => raster::render_pixel_tile(
+                product,
+                tile_context.zxy,
+                &chunks,
+                &band_scales(product),
+                layout,
+                level,
+                work,
+            ),
+        });
+    }
 
     // A raster tile interpolates, so it needs the grid points bracketing every
     // pixel it writes - including the ones in its margin, which sit outside the
@@ -448,36 +557,18 @@ pub(crate) fn make_layer(
         .wrapped_geographic_bounds
         .expanded(reach.0, reach.1);
 
-    let aggregation = product.spec.aggregation;
+    // A weighted statistic of a block that is a single cell is that cell's
+    // value, and the cells of a tile do not overlap, so where nothing is
+    // merged the maximum gives the same answer without weighing anything.
+    let aggregation = product.spec.reducer;
     let band_count = product.spec.band_specs.len();
-    let aggregation_scale = match output {
-        TileOutput::Mvt(layout) => detail::mvt_aggregation_scale(
-            maximum_detail_zoom,
-            z,
-            layout.detail.at(z),
-            (
-                product.spec.grid_spec.lng_denom,
-                product.spec.grid_spec.lat_denom,
-            ),
-            layout.extent,
-        ),
-        TileOutput::Raster(_) => {
-            detail::aggregation_scale(maximum_detail_zoom, z, detail::DEFAULT_DETAIL)
-        }
-    };
-    let aggregation_width = 1u32 << aggregation_scale;
-    let aggregation_mask = !(aggregation_width - 1);
     let grid = &product.spec.grid_spec;
 
     let ingest = |points: &mut PointMap<(u32, u32), Point>, tile: &crate::model::BaseTile| {
         debug_assert_eq!(tile.point_positions.len(), tile.point_powers.len());
         let group_key = |index: usize| {
             let (x, y) = tile.point_positions[index];
-            (
-                u32::from(x) & aggregation_mask,
-                u32::from(y) & aggregation_mask,
-                tile.point_powers[index],
-            )
+            (u32::from(x), u32::from(y), tile.point_powers[index])
         };
 
         let mut begin = 0;
@@ -491,7 +582,7 @@ pub(crate) fn make_layer(
                 end += 1;
             }
             begin = end;
-            let power = point_power.max(aggregation_scale);
+            let power = point_power;
             let width = 1 << power;
 
             let lng1 = grid.lng_0 + (grid_x as f64 - 0.5) / grid.lng_denom as f64;
@@ -506,27 +597,21 @@ pub(crate) fn make_layer(
             }
 
             let mut values = [CompactOptI32::NONE; 4];
-            let mut counts = [0; 4];
             for (band_index, band) in tile.bands.iter().enumerate() {
-                (values[band_index], counts[band_index]) =
-                    aggregate_band(&band.values[group_begin..end], aggregation);
+                values[band_index] = aggregate_band(&band.values[group_begin..end], aggregation);
             }
 
             merge_point(
                 points,
                 (grid_x, grid_y),
-                Point {
-                    values,
-                    counts,
-                    power,
-                },
+                Point { values, power },
                 aggregation,
                 band_count,
             );
         }
     };
 
-    let mut points = if aggregation_scale == 0 {
+    let mut points = {
         // The group key is the grid cell itself here, so cells stay distinct
         // across chunks; only cells lying on a chunk boundary repeat, in both
         // neighbours. Sizing the map to the input count keeps it from ever
@@ -549,44 +634,9 @@ pub(crate) fn make_layer(
             }
         }
         points
-    } else {
-        chunks
-            .par_iter()
-            .map(|chunk| {
-                let point_count = chunk
-                    .iter()
-                    .map(|(_, tile)| tile.point_positions.len())
-                    .sum::<usize>();
-                // Dense coverage packs 4^scale cells into one group; sparse
-                // data keeps them apart. Sizing to the dense count only
-                // under-estimates then, which costs a rehash rather than
-                // correctness, and never over-allocates past the input.
-                let capacity = (point_count >> (2 * aggregation_scale)).max(16);
-                let mut points = PointMap::with_capacity_and_hasher(capacity, <_>::default());
-                for (_, tile) in chunk.iter() {
-                    ingest(&mut points, tile);
-                }
-                points
-            })
-            .reduce_with(|mut left, right| {
-                for (key, point) in right {
-                    merge_point(&mut left, key, point, aggregation, band_count);
-                }
-                left
-            })
-            .unwrap_or_default()
     };
     if points.is_empty() {
         return Ok(None);
-    }
-
-    if product.spec.aggregation == Aggregation::RoughAvg {
-        for point in points.values_mut() {
-            for index in 0..band_count {
-                point.values[index] = point.values[index]
-                    .map(|value| CompactOptI32::new(Some(value / point.counts[index])));
-            }
-        }
     }
 
     // `--omit-zero` means physical zero, independently of any representative
@@ -629,12 +679,12 @@ pub(crate) fn make_layer(
             &points,
             &band_scales,
         ),
-        TileOutput::Raster(encoding) => raster::render_raster_tile(
+        TileOutput::Raster(layout) => raster::render_raster_tile(
             &product.spec,
             tile_context.zxy,
             &points,
             &band_scales,
-            encoding,
+            layout,
         ),
     }
 }
@@ -688,6 +738,429 @@ mod tests {
             }
         }
         assert!(seen.into_iter().all(|hit| hit));
+    }
+
+    /// A product of dense cells across several chunks, some 1 km among the
+    /// 250 m ones, with values a weighted statistic can tell apart.
+    fn mixed_product() -> PreparedProduct {
+        use gpv_products::{
+            model::{BandSpec, LngLatGrid},
+            products::{GpvProductElement, GpvProductIdentifier, PointValue, ProductData},
+        };
+        let mut points = Vec::new();
+        let mut state = 12345u64;
+        let mut random = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as i32
+        };
+        // 250 m cells, with gaps, then 1 km cells in a band of their own.
+        for y in 2000..2600u16 {
+            for x in 3000..3700u16 {
+                if random() % 4 != 0 {
+                    points.push((x, y, 0, random() % 50 - 10));
+                }
+            }
+        }
+        for y in (2600..2800u16).step_by(4) {
+            for x in (3000..3700u16).step_by(4) {
+                if random() % 3 != 0 {
+                    points.push((x, y, 2, random() % 50 - 10));
+                }
+            }
+        }
+        let product_data = ProductData {
+            points: points
+                .into_iter()
+                .map(|(x, y, point_power, value)| PointValue {
+                    x,
+                    y,
+                    point_id: 0,
+                    point_power,
+                    band_idx: 0,
+                    value,
+                })
+                .collect(),
+            band_specs: vec![BandSpec {
+                name: "value".to_string(),
+                ..Default::default()
+            }],
+            grid: Some(LngLatGrid {
+                lng_0: 118.0,
+                lat_0: 20.0,
+                lng_denom: 320.0,
+                lat_denom: 480.0,
+            }),
+        };
+        let product_id = GpvProductIdentifier {
+            kind: GpvProductElement::HiresNowcastIntensity,
+            generating_process: gpv_products::products::GeneratingProcessType::Forecast,
+            ..Default::default()
+        };
+        crate::prepare::prepare_product(product_id, product_data, true).unwrap()
+    }
+
+    fn decode_png(png: &[u8]) -> (u32, Vec<u8>) {
+        let decoder = ::png::Decoder::new(std::io::Cursor::new(png));
+        let mut reader = decoder.read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!(info.width, info.height);
+        (info.width, pixels)
+    }
+
+    /// A 256-pixel tile one zoom deeper holds the pixels of a quarter of a
+    /// 512-pixel tile, margin included, whatever the cells are merged by.
+    #[test]
+    fn a_small_raster_tile_is_a_quarter_of_a_large_one() {
+        let mut product = mixed_product();
+        let (lng, lat): (f64, f64) = (118.0 + 3300.0 / 320.0, 20.0 + 2300.0 / 480.0);
+        let encoding = ColorEncoding::Scalar16 {
+            min: -20.0,
+            max: 60.0,
+        };
+        for reducer in ["max", "p95"] {
+            product.spec.reducer = reducer.parse().unwrap();
+            product.spec.fill = vec![(reducer != "max").then_some(0)];
+            // Merged into blocks, and cell for cell.
+            for z in [6u8, 9] {
+                let n = f64::from(1u32 << z);
+                let x = ((lng + 180.0) / 360.0 * n) as u32;
+                let y = ((1.0
+                    - (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln()
+                        / std::f64::consts::PI)
+                    / 2.0
+                    * n) as u32;
+                let large = make_layer(
+                    &TileContext::new((z, x, y)),
+                    &product,
+                    "layer",
+                    TileOutput::Raster(RasterLayout::new(encoding)),
+                )
+                .unwrap()
+                .unwrap();
+                let (large_side, large) = decode_png(&large);
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let small = make_layer(
+                        &TileContext::new((z + 1, 2 * x + dx, 2 * y + dy)),
+                        &product,
+                        "layer",
+                        TileOutput::Raster(RasterLayout {
+                            encoding,
+                            size: 256,
+                        }),
+                    )
+                    .unwrap();
+                    let window = |row: usize| {
+                        let begin = ((row + 256 * dy as usize) * 514 + 256 * dx as usize) * 4;
+                        &large[begin..begin + 258 * 4]
+                    };
+                    let Some(small) = small else {
+                        // An empty quarter: nothing of it may be on the grid.
+                        let off_grid = encoding.off_grid()[2];
+                        for row in 0..258usize {
+                            assert!(
+                                window(row).chunks(4).all(|pixel| pixel[2] == off_grid),
+                                "{reducer} z{z} quarter ({dx},{dy}) is empty but row {row} is not"
+                            );
+                        }
+                        continue;
+                    };
+                    let (small_side, small) = decode_png(&small);
+                    assert_eq!((large_side, small_side), (514, 258));
+                    for row in 0..258usize {
+                        assert_eq!(
+                            &small[row * 258 * 4..(row + 1) * 258 * 4],
+                            window(row),
+                            "{reducer} z{z} quarter ({dx},{dy}) row {row}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Where cells are wider than a pixel but shorter than one, a strip of
+    /// heavy rain one cell high has to show in every column it crosses.
+    /// Sampling at pixel centres skipped the rows no centre fell in.
+    #[test]
+    fn a_strip_shorter_than_a_pixel_survives_at_the_zoom_cells_turn_wider() {
+        use gpv_products::{
+            model::{BandSpec, LngLatGrid},
+            products::{
+                GeneratingProcessType, GpvProductElement, GpvProductIdentifier, PointValue,
+                ProductData,
+            },
+        };
+        let grid = LngLatGrid {
+            lng_0: 118.0,
+            lat_0: 20.0,
+            lng_denom: 320.0,
+            lat_denom: 480.0,
+        };
+        let strip = 2200u16;
+        let mut points = Vec::new();
+        for y in 2000..2400u16 {
+            for x in 3000..3400u16 {
+                points.push(PointValue {
+                    x,
+                    y,
+                    point_id: 0,
+                    point_power: 0,
+                    band_idx: 0,
+                    value: if y == strip { 50 } else { 1 },
+                });
+            }
+        }
+        let product = crate::prepare::prepare_product(
+            GpvProductIdentifier {
+                kind: GpvProductElement::HiresNowcastIntensity,
+                generating_process: GeneratingProcessType::Forecast,
+                ..Default::default()
+            },
+            ProductData {
+                points,
+                band_specs: vec![BandSpec {
+                    name: "value".to_string(),
+                    ..Default::default()
+                }],
+                grid: Some(grid.clone()),
+            },
+            false,
+        )
+        .unwrap();
+
+        // At zoom 8 a cell is about 1.14 pixels wide and 0.84 high here.
+        let z = 8u8;
+        let layout = RasterLayout::new(ColorEncoding::Scalar16 {
+            min: 0.0,
+            max: 100.0,
+        });
+        assert!(raster::uses_pixel_aggregation(
+            &product.spec,
+            (z, 0, 0),
+            layout.size
+        ));
+        let n = f64::from(1u32 << z);
+        let (lng, lat): (f64, f64) = (118.0 + 3200.0 / 320.0, 20.0 + f64::from(strip) / 480.0);
+        let x = ((lng + 180.0) / 360.0 * n) as u32;
+        let y = ((1.0
+            - (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln() / std::f64::consts::PI)
+            / 2.0
+            * n) as u32;
+        let png = make_layer(
+            &TileContext::new((z, x, y)),
+            &product,
+            "layer",
+            TileOutput::Raster(layout),
+        )
+        .unwrap()
+        .unwrap();
+        let (side, pixels) = decode_png(&png);
+        let side = side as usize;
+        let code = |row: usize, column: usize| {
+            let pixel = &pixels[(row * side + column) * 4..(row * side + column) * 4 + 4];
+            (pixel[2] == 255).then_some(u16::from(pixel[0]) << 8 | u16::from(pixel[1]))
+        };
+        let mut counts = std::collections::HashMap::<u16, usize>::new();
+        for row in 0..side {
+            for column in 0..side {
+                if let Some(code) = code(row, column) {
+                    *counts.entry(code).or_default() += 1;
+                }
+            }
+        }
+        let background = counts
+            .into_iter()
+            .max_by_key(|&(_, count)| count)
+            .unwrap()
+            .0;
+        let mut columns_on_grid = 0;
+        for column in 0..side {
+            if (0..side).all(|row| code(row, column).is_none()) {
+                continue;
+            }
+            columns_on_grid += 1;
+            assert!(
+                (0..side).any(|row| code(row, column).is_some_and(|code| code > background)),
+                "the strip is missing from column {column}"
+            );
+        }
+        assert!(columns_on_grid > 100);
+    }
+
+    /// A lattice layer is one unit square per pixel with a value, margin
+    /// included, merged: its polygons cover exactly as many units as pixels
+    /// hold a value.
+    #[test]
+    fn a_lattice_layer_covers_one_unit_per_pixel_with_a_value() {
+        let mut product = mixed_product();
+        product.spec.reducer = "p95".parse().unwrap();
+        product.spec.fill = vec![Some(0)];
+        let (lng, lat): (f64, f64) = (118.0 + 3300.0 / 320.0, 20.0 + 2300.0 / 480.0);
+        for (detail, z) in [8u8, 7]
+            .into_iter()
+            .flat_map(|d| [4u8, 6, 7].map(|z| (d, z)))
+        {
+            let across = 1u32 << detail;
+            let layout = MvtLayout {
+                detail: detail.to_string().parse().unwrap(),
+                ..Default::default()
+            };
+            let n = f64::from(1u32 << z);
+            let zxy = (
+                z,
+                ((lng + 180.0) / 360.0 * n) as u32,
+                ((1.0
+                    - (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln()
+                        / std::f64::consts::PI)
+                    / 2.0
+                    * n) as u32,
+            );
+            let bytes = make_layer(
+                &TileContext::new(zxy),
+                &product,
+                "layer",
+                TileOutput::Mvt(layout),
+            )
+            .unwrap()
+            .unwrap();
+            let reader = fast_mvt::MvtReaderRef::new(&bytes).unwrap();
+            let layer = reader.layers().next().unwrap();
+            assert_eq!(layer.extent(), across, "detail {detail} z{z}");
+            let ring_area = |ring: &fast_mvt::MvtLineString| {
+                ring.0
+                    .windows(2)
+                    .map(|pair| {
+                        i64::from(pair[0].x) * i64::from(pair[1].y)
+                            - i64::from(pair[1].x) * i64::from(pair[0].y)
+                    })
+                    .sum::<i64>()
+                    .abs()
+                    / 2
+            };
+            let mut area = 0;
+            for feature in layer.features() {
+                let polygons = match feature.geometry().unwrap() {
+                    fast_mvt::MvtGeometry::MultiPolygon(polygons) => polygons.0,
+                    fast_mvt::MvtGeometry::Polygon(polygon) => vec![polygon],
+                    other => panic!("a lattice feature is a polygon, not {other:?}"),
+                };
+                for polygon in polygons {
+                    area += ring_area(polygon.exterior());
+                    area -= polygon.interiors().iter().map(ring_area).sum::<i64>();
+                }
+            }
+
+            let chunks = source_chunks(&product, zxy, TileOutput::Mvt(layout));
+            let pixels = reduce::with_workspace(|work| {
+                raster::aggregate_pixels(
+                    &product,
+                    zxy,
+                    &chunks,
+                    raster::PixelLattice {
+                        across,
+                        margin: layout.buffer * across / 256,
+                        bands: 1,
+                        every_band: false,
+                        output: TileOutput::Mvt(layout),
+                    },
+                    work,
+                )
+                .map_or(0, |_| work.touched.len())
+            });
+            assert!(pixels > 0, "detail {detail} z{z}");
+            assert_eq!(area, pixels as i64, "detail {detail} z{z}");
+        }
+    }
+
+    /// The pyramid stands in for gathering the cells, so every tile has to
+    /// come out the same byte for byte with it as without it.
+    ///
+    /// A vector tile gathers only the chunks under it, so its margin comes out
+    /// whole only from the pyramid; it is compared without one. A raster tile
+    /// reads its neighbours, and is compared margin and all.
+    #[test]
+    fn the_pyramid_draws_the_tiles_the_cells_do() {
+        let mut compared = 0;
+        for (reducer, fill) in [
+            ("max", None),
+            ("max", Some(40)),
+            ("min", Some(3)),
+            ("mean", None),
+            ("mean", Some(0)),
+            ("avg", None),
+            ("bit-or", Some(64)),
+            ("p95", None),
+            ("p95", Some(0)),
+            ("p50", Some(7)),
+            ("p99.5", None),
+            ("p0", Some(3)),
+            ("p100", None),
+        ] {
+            compared += pyramid_matches_cells(reducer, fill);
+        }
+        assert!(compared > 100, "{compared}");
+    }
+
+    /// Draws tiles round one spot with the pyramid and without, and returns
+    /// how many held anything.
+    fn pyramid_matches_cells(reducer: &str, fill: Option<i32>) -> usize {
+        let mut product = mixed_product();
+        product.spec.reducer = reducer.parse().unwrap();
+        product.spec.fill = vec![fill; product.spec.band_specs.len()];
+        let (lng, lat): (f64, f64) = (118.0 + 3300.0 / 320.0, 20.0 + 2300.0 / 480.0);
+        let outputs = [
+            TileOutput::Mvt(MvtLayout {
+                buffer: 0,
+                ..Default::default()
+            }),
+            TileOutput::Mvt(MvtLayout {
+                buffer: 0,
+                detail: "7".parse().unwrap(),
+                ..Default::default()
+            }),
+            TileOutput::Raster(RasterLayout::new(ColorEncoding::Scalar16 {
+                min: -20.0,
+                max: 60.0,
+            })),
+            TileOutput::Raster(RasterLayout {
+                encoding: ColorEncoding::Scalar16 {
+                    min: -20.0,
+                    max: 60.0,
+                },
+                size: 256,
+            }),
+        ];
+        let mut compared = 0;
+        for output in outputs {
+            product.pyramid = None;
+            crate::archive::build_pyramid(&mut product, 0, 10, output);
+            assert!(product.pyramid.is_some(), "{output:?}");
+            for z in 2u8..=9 {
+                let n = f64::from(1u32 << z);
+                let x = ((lng + 180.0) / 360.0 * n) as u32;
+                let y = ((1.0
+                    - (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln()
+                        / std::f64::consts::PI)
+                    / 2.0
+                    * n) as u32;
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let context = TileContext::new((z, x + dx, y + dy));
+                    let with = make_layer(&context, &product, "layer", output).unwrap();
+                    let pyramid = product.pyramid.take();
+                    let without = make_layer(&context, &product, "layer", output).unwrap();
+                    product.pyramid = pyramid;
+                    assert_eq!(
+                        with, without,
+                        "{reducer} {fill:?} {output:?} z{z} +({dx},{dy})"
+                    );
+                    compared += usize::from(with.is_some());
+                }
+            }
+        }
+        compared
     }
 
     fn value(value: i32) -> CompactOptI32 {
@@ -836,76 +1309,29 @@ mod tests {
     }
 
     #[test]
-    fn rough_avg_aggregates_sum_and_count_in_one_pass() {
-        let values = [value(7), CompactOptI32::NONE, value(-2), value(5)];
-
-        let (sum, count) = aggregate_band(&values, Aggregation::RoughAvg);
-
-        assert_eq!(sum, value(10));
-        assert_eq!(count, 3);
-    }
-
-    #[test]
-    fn non_average_aggregations_do_not_track_counts() {
+    fn source_cell_values_skip_missing_samples() {
         let values = [value(6), CompactOptI32::NONE, value(3)];
 
-        for (aggregation, expected) in [
-            (Aggregation::Max, 6),
-            (Aggregation::Min, 3),
-            (Aggregation::BitOr, 7),
-        ] {
-            let (aggregated, count) = aggregate_band(&values, aggregation);
+        for (aggregation, expected) in [(Reducer::Max, 6), (Reducer::Min, 3), (Reducer::BitOr, 7)] {
+            let aggregated = aggregate_band(&values, aggregation);
             assert_eq!(aggregated, value(expected));
-            assert_eq!(count, 0);
         }
     }
 
     #[test]
-    fn merge_only_updates_active_bands() {
-        let key = (1, 2);
-        let mut points = PointMap::default();
-        points.insert(
-            key,
-            Point {
-                values: [value(10), value(20), value(30), value(40)],
-                counts: [1, 2, 3, 4],
-                power: 1,
-            },
-        );
-
-        merge_point(
-            &mut points,
-            key,
-            Point {
-                values: [value(5), value(7), value(11), value(13)],
-                counts: [5, 6, 7, 8],
-                power: 2,
-            },
-            Aggregation::RoughAvg,
-            2,
-        );
-
-        let point = &points[&key];
-        assert_eq!(point.values, [value(15), value(27), value(30), value(40)]);
-        assert_eq!(point.counts, [6, 8, 3, 4]);
-        assert_eq!(point.power, 2);
-    }
-
-    #[test]
-    fn non_average_merge_does_not_update_counts_or_trailing_bands() {
+    fn source_cell_merge_preserves_trailing_bands() {
         let key = (1, 2);
 
         for (aggregation, expected) in [
-            (Aggregation::Max, [value(10), value(20)]),
-            (Aggregation::Min, [value(5), value(7)]),
-            (Aggregation::BitOr, [value(15), value(23)]),
+            (Reducer::Max, [value(10), value(20)]),
+            (Reducer::Min, [value(5), value(7)]),
+            (Reducer::BitOr, [value(15), value(23)]),
         ] {
             let mut points = PointMap::default();
             points.insert(
                 key,
                 Point {
                     values: [value(10), value(20), value(30), value(40)],
-                    counts: [1, 2, 3, 4],
                     power: 1,
                 },
             );
@@ -915,7 +1341,6 @@ mod tests {
                 key,
                 Point {
                     values: [value(5), value(7), value(11), value(13)],
-                    counts: [5, 6, 7, 8],
                     power: 2,
                 },
                 aggregation,
@@ -925,7 +1350,6 @@ mod tests {
             let point = &points[&key];
             assert_eq!(&point.values[..2], &expected);
             assert_eq!(&point.values[2..], &[value(30), value(40)]);
-            assert_eq!(point.counts, [1, 2, 3, 4]);
             assert_eq!(point.power, 2);
         }
     }

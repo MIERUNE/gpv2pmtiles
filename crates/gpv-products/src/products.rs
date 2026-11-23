@@ -728,7 +728,7 @@ impl GpvProductIdentifier {
             | OceanJpSalinity | OceanJpTemperature | OceanNpCurrent | OceanNpHeight
             | OceanNpSalinity | OceanNpTemperature | Sst | SstDaily | SstHimawari
             | SuikeiSunshine | SuikeiTemperature | TidePressure | TideWind | WemWave
-            | OceanJpIceDrift | NowcastEchoTops => Aggregation::RoughAvg,
+            | OceanJpIceDrift | NowcastEchoTops => Aggregation::Mean,
             HiresCloudQc => Aggregation::BitOr,
             _ => Aggregation::Max,
         }

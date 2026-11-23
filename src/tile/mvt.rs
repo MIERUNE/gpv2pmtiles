@@ -26,6 +26,153 @@ pub(super) fn render_mvt_layer(
         tile_bounds,
         layout,
     );
+    encode_layer(
+        layer_name,
+        tileset_spec,
+        layout.extent,
+        grouped_rectangles,
+        band_scales,
+    )
+}
+
+/// Renders a layer from a lattice of `2^detail` pixels across the tile, each
+/// one unit of an extent of the same size.
+///
+/// The pixels are gathered as a raster tile's are, so the blocks line up with
+/// the tile instead of the source grid: none straddles an edge, and none is so
+/// small that rounding to the extent loses it. The margin is whole pixels of
+/// the same lattice, so that an outline drawn along a polygon falls outside
+/// the tile rather than along its edge.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn render_lattice_layer(
+    layer_name: &str,
+    product: &crate::model::PreparedProduct,
+    zxy: super::Zxy,
+    chunks: &[&[(u64, crate::model::BaseTile)]],
+    layout: MvtLayout,
+    level: u8,
+    band_scales: &Vec<BandScale<'_>>,
+    work: &mut super::reduce::Workspace,
+) -> Result<Option<Vec<u8>>> {
+    let spec = &product.spec;
+    let bands = spec.band_specs.len();
+    let across = 1u32 << layout.detail.at(zxy.0);
+    let margin = layout.buffer * across / 256;
+    let side = (across + 2 * margin) as usize;
+    let corner = (
+        i64::from(zxy.2) * i64::from(across) - i64::from(margin),
+        i64::from(zxy.1) * i64::from(across) - i64::from(margin),
+    );
+    let finished = |b: usize, raw: Option<f64>| {
+        CompactOptI32::new(
+            raw.and_then(|raw| crate::quantize::postprocess(raw, b, spec))
+                .map(|raw| raw.round_ties_even() as i32),
+        )
+    };
+
+    // (row, column, values) of the pixels with a value, row by row.
+    let mut cells = Vec::new();
+    if let Some(pyramid) = super::raster::nested_pyramid(product, level, corner, side) {
+        pyramid.window(level, corner, side, |row, column, raw| {
+            let mut values = [CompactOptI32::NONE; 4];
+            for (b, value) in values.iter_mut().enumerate().take(bands) {
+                *value = finished(b, Some(raw[b]).filter(|raw| !raw.is_nan()));
+            }
+            if values.iter().any(|value| value.get().is_some()) {
+                cells.push((row, column, values));
+            }
+        });
+    } else {
+        let Some(size) = super::raster::aggregate_pixels(
+            product,
+            zxy,
+            chunks,
+            super::raster::PixelLattice {
+                across,
+                margin,
+                bands,
+                every_band: false,
+                output: super::TileOutput::Mvt(layout),
+            },
+            work,
+        ) else {
+            return Ok(None);
+        };
+        let super::reduce::Workspace {
+            entries,
+            scratch,
+            pixels,
+            methods,
+            capacities,
+            touched,
+        } = work;
+        touched.sort_unstable();
+        for &index in touched.iter() {
+            let index = index as usize;
+            let mut values = [CompactOptI32::NONE; 4];
+            for (b, value) in values.iter_mut().enumerate().take(bands) {
+                *value = finished(
+                    b,
+                    pixels[index * bands + b].finish(
+                        methods[index],
+                        capacities[index],
+                        spec.fill[b],
+                        entries,
+                        scratch,
+                    ),
+                );
+            }
+            if values.iter().any(|value| value.get().is_some()) {
+                cells.push((index / size, index % size, values));
+            }
+        }
+    }
+
+    // Runs of equal values along a row become one rectangle, which leaves the
+    // union a fraction of the edges to merge.
+    let margin = margin as i32;
+    let mut grouped_rectangles: HashMap<[CompactOptI32; 4], Vec<IntRect>> = HashMap::default();
+    let mut run: Option<(usize, usize, usize, [CompactOptI32; 4])> = None;
+    let mut flush = |run: Option<(usize, usize, usize, [CompactOptI32; 4])>| {
+        if let Some((row, first, end, values)) = run {
+            grouped_rectangles
+                .entry(values)
+                .or_default()
+                .push(IntRect::new(
+                    first as i32 - margin,
+                    row as i32 - margin,
+                    end as i32 - margin,
+                    row as i32 + 1 - margin,
+                ));
+        }
+    };
+    for (row, column, values) in cells {
+        run = match run {
+            Some((run_row, first, end, run_values))
+                if run_row == row && end == column && run_values == values =>
+            {
+                Some((row, first, column + 1, values))
+            }
+            other => {
+                flush(other);
+                Some((row, column, column + 1, values))
+            }
+        };
+    }
+    flush(run);
+
+    encode_layer(layer_name, spec, across, grouped_rectangles, band_scales)
+}
+
+/// Merges each group of rectangles into polygons and writes them as the
+/// features of one layer.
+fn encode_layer(
+    layer_name: &str,
+    tileset_spec: &TilesetSpec,
+    extent: u32,
+    grouped_rectangles: HashMap<[CompactOptI32; 4], Vec<IntRect>>,
+    band_scales: &Vec<BandScale<'_>>,
+) -> Result<Option<Vec<u8>>> {
     if grouped_rectangles.is_empty() {
         return Ok(None);
     }
@@ -51,7 +198,7 @@ pub(super) fn render_mvt_layer(
 
     // Encode features
     let mut layer = MvtLayerBuilder::new(layer_name)?;
-    layer.extent(std::num::NonZeroU32::new(layout.extent).expect("MVT extent is positive"));
+    layer.extent(std::num::NonZeroU32::new(extent).expect("MVT extent is positive"));
     for (values, geometry) in value_geom {
         let mut feature = layer.feature(&geometry)?;
         for (band, raw_value) in band_scales.iter().zip(values) {
@@ -244,11 +391,7 @@ mod tests {
     fn cell(dn: i32, power: u8) -> Point {
         let mut values = [CompactOptI32::NONE; 4];
         values[0] = value(dn);
-        Point {
-            values,
-            counts: [1, 0, 0, 0],
-            power,
-        }
+        Point { values, power }
     }
 
     /// One cell reaching past every edge of the tile, so the rectangle is
@@ -285,7 +428,9 @@ mod tests {
             name: String::new(),
             base_z: 0,
             grid_spec: grid(),
-            aggregation: gpv_products::model::Aggregation::Max,
+            color_map: None,
+            reducer: crate::tile::Reducer::Max,
+            fill: vec![None],
             band_specs: vec![gpv_products::model::BandSpec {
                 name: "DN".to_string(),
                 ..Default::default()

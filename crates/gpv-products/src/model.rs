@@ -20,6 +20,6 @@ pub struct LngLatGrid {
 pub enum Aggregation {
     Max,
     Min,
-    RoughAvg,
+    Mean,
     BitOr,
 }

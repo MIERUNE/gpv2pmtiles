@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     model::PreparedProduct,
-    tile::{ColorEncoding, RangeReport, TileOutput},
+    tile::{ColorEncoding, RangeReport, RasterLayout, Reducer, TileOutput},
 };
 
 #[derive(Serialize)]
@@ -63,6 +63,31 @@ fn level_descriptor(product: &PreparedProduct) -> Value {
     }
 }
 
+/// Pixel aggregation uses basic-grid-cell weights for every output format.
+fn aggregation_descriptor(product: &PreparedProduct) -> Value {
+    let spec = &product.spec;
+    let fill = spec
+        .band_specs
+        .iter()
+        .zip(&spec.fill)
+        .filter_map(|(band, value)| {
+            let raw = f64::from((*value)?);
+            let physical = (f64::from(band.reference_value)
+                + raw * 2f64.powi(i32::from(band.binary_scale)))
+                * 10f64.powi(-i32::from(band.decimal_scale));
+            Some((band.name.clone(), json!(physical)))
+        })
+        .collect::<Map<String, Value>>();
+    json!({
+        "method": spec.reducer.name(),
+        "fill": fill,
+        "missing_default": "exclude-unless-filled",
+        "weighting": "basic-grid-cell-count",
+        "empty_block": "missing",
+        "quantization": "after-aggregation",
+    })
+}
+
 /// Everything a client needs to decode a raster tile, save what differs
 /// between forecast times.
 ///
@@ -70,8 +95,8 @@ fn level_descriptor(product: &PreparedProduct) -> Value {
 /// client blending two times has to configure its decode and its texture
 /// coordinates before opening any archive, so the manifest cannot carry a
 /// summary of this and expect the client to find the rest.
-pub(crate) fn raster_encoding(product: Option<&PreparedProduct>, encoding: ColorEncoding) -> Value {
-    let mut raster = encoding.descriptor();
+pub(crate) fn raster_encoding(product: Option<&PreparedProduct>, layout: RasterLayout) -> Value {
+    let mut raster = layout.encoding.descriptor();
     let Some(object) = raster.as_object_mut() else {
         return raster;
     };
@@ -83,26 +108,41 @@ pub(crate) fn raster_encoding(product: Option<&PreparedProduct>, encoding: Color
     // How the pixels are stored, kept apart from what they mean: a different
     // container would leave the decode rule standing.
     object.insert("container".into(), json!("png"));
-    object.insert("tile_size".into(), json!(crate::tile::RASTER_TILE_EXTENT));
+    object.insert("tile_size".into(), json!(layout.size));
     // The stored image is larger than the tile: a client samples the inner
     // square and lets the filter reach into the margin.
     object.insert("buffer".into(), json!(crate::tile::RASTER_TILE_BUFFER));
-    object.insert("image_size".into(), json!(crate::tile::RASTER_IMAGE_EXTENT));
+    object.insert("image_size".into(), json!(layout.image_size()));
 
     if let Some(product) = product {
+        let classified = layout.encoding == ColorEncoding::Classified;
+        if let Some(map) = product.spec.color_map.as_ref().filter(|_| classified) {
+            object.insert("color_map".into(), map.descriptor());
+        }
+        object.insert("aggregation".into(), aggregation_descriptor(product));
+        object.insert("resampling".into(),json!({
+            "downsampling":"basic-cell-centre-aggregation",
+            "weighting":"basic-grid-cell-count",
+            "ground_area_weighted":false,
+            "downsampling_condition":"either-native-axis-finer-than-pixel-somewhere-in-grid-frame",
+            "upsampling":if classified || product.spec.quantize.iter().any(Option::is_some) {"nearest"} else {"bilinear"},
+            "source_interpretation_at_low_zoom":"constant-per-native-cell",
+        }));
         object.insert(
             "bands".into(),
             json!(
-                product.spec.band_specs[..encoding.bands()]
+                product.spec.band_specs[..layout.encoding.bands()]
                     .iter()
                     .map(|band| band.name.as_str())
                     .collect::<Vec<_>>()
             ),
         );
-        object.insert("sampling".into(), sampling_contract(product));
+        object.insert("sampling".into(), if classified {
+            json!({"sample_space": "color", "texture_format": "rgba8unorm-srgb", "filter": "nearest", "color_space_conversion": "srgb", "premultiply_alpha": true, "mipmaps": false})
+        } else { sampling_contract(product) });
         object.insert("level".into(), level_descriptor(product));
     }
-    if let ColorEncoding::VectorField { .. } = encoding {
+    if let ColorEncoding::VectorField { .. } = layout.encoding {
         // Which way each component points, so that a client need not infer it
         // from the band names. The order is fixed by the encoding, which reads
         // `u` before `v`.
@@ -225,13 +265,27 @@ pub(crate) fn generate_metadata(
                 .iter()
                 .zip(&product.spec.omit_zero)
                 .filter_map(|(band, omit)| {
-                    Some((band.name.clone(), json!(omit.as_ref()?.physical())))
+                    // A band that cannot represent zero omits it only from
+                    // a weighted statistic, so it is listed only then.
+                    let omit = omit.as_ref()?;
+                    (omit.has_stored() || product.spec.reducer.is_weighted())
+                        .then(|| (band.name.clone(), json!(omit.physical())))
                 })
                 .collect::<Map<String, Value>>()
         })
         .unwrap_or_default();
 
+    // MVT and raster low zooms both aggregate into Mercator pixels.
+    let aggregation = products.first().and_then(|product| {
+        (product.spec.reducer != Reducer::from(product.product_id.aggregation())
+            || matches!(output, TileOutput::Mvt(_)))
+        .then(|| aggregation_descriptor(product))
+    });
+
     let mut metadata = Map::new();
+    if let Some(aggregation) = aggregation {
+        metadata.insert("aggregation".into(), aggregation);
+    }
     metadata.insert("name".into(), json!(archive_name));
     metadata.insert("description".into(), json!(""));
     metadata.insert(
@@ -251,12 +305,12 @@ pub(crate) fn generate_metadata(
         // A raster archive has no attributes to describe, but it does need to
         // say how a pixel turns back into a value: the parameters are chosen
         // per archive and a client cannot recover them from the tiles.
-        TileOutput::Raster(encoding) => {
-            let mut raster = raster_encoding(products.first(), encoding);
+        TileOutput::Raster(layout) => {
+            let mut raster = raster_encoding(products.first(), layout);
             if let (Some(object), Some(range)) = (raster.as_object_mut(), range) {
                 // The only part that belongs to one archive rather than to the
                 // set: what the source values of this forecast time were.
-                object.insert("source_range".into(), range_report(&range, encoding));
+                object.insert("source_range".into(), range_report(&range, layout.encoding));
             }
             metadata.insert("raster_encoding".into(), raster);
             if let Some(product) = products.first() {

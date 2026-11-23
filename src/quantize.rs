@@ -39,6 +39,12 @@ impl BandQuantize {
         above.saturating_sub(1) as i32
     }
 
+    pub(crate) fn class_of_physical(&self, value: f64) -> i32 {
+        self.bounds
+            .partition_point(|bound| *bound <= value)
+            .saturating_sub(1) as i32
+    }
+
     /// Physical value emitted for a class index produced by [`Self::class_of`].
     #[inline]
     pub fn output(&self, class: i32) -> f64 {
@@ -75,6 +81,48 @@ impl BandQuantize {
     pub fn outputs(&self) -> &[f64] {
         &self.outputs
     }
+}
+
+/// Applies omissions and quantization to a completed statistic, preserving a
+/// fractional mean until it has been classified. Returns a class index for a
+/// quantized band, or the unchanged raw value otherwise.
+pub(crate) fn postprocess(raw: f64, index: usize, spec: &crate::model::TilesetSpec) -> Option<f64> {
+    if spec.omit_zero[index].as_ref().is_some_and(|omit| {
+        omit.contains_fractional(raw) || is_physical_zero(raw, &spec.band_specs[index])
+    }) {
+        return None;
+    }
+    if let Some(quantize) = &spec.quantize[index] {
+        let class = if raw.fract() == 0.0 {
+            quantize.class_of(raw as i32)
+        } else {
+            let band = &spec.band_specs[index];
+            let physical = (f64::from(band.reference_value)
+                + raw * 2f64.powi(i32::from(band.binary_scale)))
+                * 10f64.powi(-i32::from(band.decimal_scale));
+            quantize.class_of_physical(physical)
+        };
+        if spec.omit_class[index]
+            .as_ref()
+            .is_some_and(|omit| omit.contains(class))
+        {
+            None
+        } else {
+            Some(f64::from(class))
+        }
+    } else {
+        Some(raw)
+    }
+}
+
+/// Whether a fractional raw value is physical zero, to within rounding.
+///
+/// The scaling is `(reference + raw * 2^binary) * 10^-decimal`, so zero is
+/// where `reference + raw * 2^binary` vanishes; the tolerance is a sliver of
+/// one raw step.
+fn is_physical_zero(raw: f64, band: &BandSpec) -> bool {
+    let step = 2f64.powi(i32::from(band.binary_scale));
+    (f64::from(band.reference_value) + raw * step).abs() <= step * 1e-9
 }
 
 /// Resolves the raw `--quantize` arguments against the bands of the product.
@@ -247,6 +295,17 @@ impl BandOmit {
         self.stored.contains(&stored)
     }
 
+    pub(crate) fn contains_fractional(&self, raw: f64) -> bool {
+        self.stored.iter().any(|&v| f64::from(v) == raw)
+    }
+
+    /// Whether some raw value stands for an omitted physical value. A band
+    /// that cannot represent zero has none, and omits only a fractional
+    /// statistic that comes out at it.
+    pub(crate) fn has_stored(&self) -> bool {
+        !self.stored.is_empty()
+    }
+
     pub fn physical(&self) -> &[f64] {
         &self.physical
     }
@@ -264,11 +323,13 @@ pub(crate) fn resolve_zero_omits(
         return vec![None; band_specs.len()];
     }
 
+    // Every band takes the omission: a weighted mean is fractional and can
+    // land on physical zero even where no raw value does.
     band_specs
         .iter()
         .map(|band| {
-            physical_to_raw_exact(0.0, band).map(|raw| BandOmit {
-                stored: vec![raw],
+            Some(BandOmit {
+                stored: physical_to_raw_exact(0.0, band).into_iter().collect(),
                 physical: vec![0.0],
             })
         })
@@ -358,6 +419,48 @@ pub(crate) fn validate_omit_class_syntax(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Checks the syntax of `--fill` without needing the band specs.
+pub(crate) fn validate_fill_syntax(args: &[String]) -> Result<()> {
+    for arg in args {
+        let value = arg.split_once('=').map_or(arg.as_str(), |(_, value)| value);
+        parse_number(value)
+            .with_context(|| format!("--fill expects [<band>=]<value> but found {arg:?}"))?;
+    }
+    Ok(())
+}
+
+/// Resolves the physical `--fill` values into raw ones, per band.
+///
+/// A fill is counted as a stored value would be, so it has to be one: a value
+/// between two raw steps is refused rather than rounded, which would make the
+/// statistic describe a value nobody asked for.
+pub(crate) fn resolve_fill(args: &[String], band_specs: &[BandSpec]) -> Result<Vec<Option<i32>>> {
+    let mut resolved = vec![None; band_specs.len()];
+    for arg in args {
+        let (band_name, value) = split_band_prefix_for(arg, band_specs, "--fill")?;
+        let index = band_specs
+            .iter()
+            .position(|band| band.name == band_name)
+            .with_context(|| {
+                format!(
+                    "unknown band {band_name:?} in --fill; this product has {}",
+                    band_choices(band_specs)
+                )
+            })?;
+        ensure!(
+            resolved[index].is_none(),
+            "band {band_name:?} is given --fill more than once"
+        );
+        let physical = parse_number(value)?;
+        resolved[index] = Some(
+            physical_to_raw_exact(physical, &band_specs[index]).with_context(|| {
+                format!("--fill {physical} is not a value band {band_name:?} can hold exactly")
+            })?,
+        );
+    }
+    Ok(resolved)
 }
 
 /// Converts a physical value to its raw value, or `None` if it is not on the grid.
@@ -609,15 +712,23 @@ mod tests {
         assert!(omits[0].as_ref().unwrap().contains(0));
     }
 
+    /// No raw value is physical zero here, so no cell is left out, but a mean
+    /// halfway between two raw steps is, and goes.
     #[test]
-    fn omit_zero_is_a_no_op_when_physical_zero_is_not_representable() {
+    fn omit_zero_reaches_only_a_fractional_zero_when_no_raw_value_is_zero() {
         let band = BandSpec {
             name: "value".to_string(),
             reference_value: 0.5,
             ..Default::default()
         };
 
-        assert!(resolve_zero_omits(true, &[band])[0].is_none());
+        let omit = resolve_zero_omits(true, std::slice::from_ref(&band))[0]
+            .clone()
+            .unwrap();
+        assert!(!omit.has_stored());
+        assert!((-3..=3).all(|raw| !omit.contains(raw)));
+        assert!(is_physical_zero(-0.5, &band));
+        assert!(!is_physical_zero(-0.25, &band));
     }
 
     #[test]

@@ -1,21 +1,9 @@
 //! Encodes band values into RGBA raster tiles.
 //!
-//! A raster tile carries data rather than a picture, so the client has to know
-//! how to invert whatever was done to it. Every [`ColorEncoding`] therefore
-//! ships a [`ColorEncoding::descriptor`] into the archive metadata. Its
-//! structured channel, offset and scale fields are sufficient to invert the
-//! pixels; no layer has to guess from a tileset name.
-//!
-//! Two hazards apply to every encoding here, and both are quiet when they bite:
-//!
-//! * **Alpha is never a mask.** Several browser image-decoding paths -
-//!   `createImageBitmap` among them - premultiply alpha, which zeroes the
-//!   colour channels of a transparent pixel. That would destroy exactly the
-//!   values the mask is marking. Tiles are always opaque, and coverage is
-//!   spelled out in a colour channel instead.
-//! * **Parameters belong to the archive, never to a tile.** Deriving a range
-//!   per tile would make neighbouring tiles decode the same byte differently,
-//!   and the field would jump across every tile seam.
+//! Data encodings keep channels opaque so browser alpha premultiplication
+//! cannot destroy measurements. Classified output instead paints fixed RGBA
+//! colours for direct display, with transparent missing pixels. Parameters
+//! and colour maps are shared by every tile and recorded in the metadata.
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -26,12 +14,50 @@ use crate::{
     tile::{BandScale, Point, PointMap, Zxy},
 };
 
-/// Side length in pixels of a raster tile.
+/// Side length in pixels of a raster tile, unless `--raster-size` says otherwise.
 pub(crate) const TILE_EXTENT: u32 = 512;
+
+/// The tile sizes `--raster-size` accepts.
+pub(crate) const TILE_SIZES: [u32; 2] = [256, 512];
+
+/// What a raster tile is: how its pixels encode values, and how many there are.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RasterLayout {
+    pub(crate) encoding: ColorEncoding,
+    /// Pixels across the tile, without the margin.
+    pub(crate) size: u32,
+}
+
+impl RasterLayout {
+    pub(crate) fn new(encoding: ColorEncoding) -> Self {
+        Self {
+            encoding,
+            size: TILE_EXTENT,
+        }
+    }
+
+    /// The side of the stored image: the tile plus its margin on both sides.
+    pub(crate) fn image_size(self) -> u32 {
+        self.size + 2 * TILE_BUFFER
+    }
+
+    /// How many zooms deeper than a [`TILE_EXTENT`] tile one of this size
+    /// lies on the same pixels.
+    ///
+    /// The pixels of a zoom are fixed by how many there are around the world,
+    /// the tile size times `2^z`, so a 256-pixel tile at `z + 1` holds exactly
+    /// the pixels of a quarter of a 512-pixel tile at `z`. Shifting the zoom by
+    /// this keeps the content, and the aggregation behind it, the same.
+    pub(crate) fn zoom_offset(self) -> u8 {
+        (TILE_EXTENT / self.size).trailing_zeros() as u8
+    }
+}
 
 /// How the band values of one grid cell become a pixel.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum ColorEncoding {
+    /// A display image painted by the product's classified colour map.
+    Classified,
     /// A scalar spread over all 24 colour bits. Exact to `interval`, at the
     /// cost of having no channel left for a mask, so it suits a grid that
     /// covers every tile it appears in - a global model, or terrain.
@@ -118,6 +144,13 @@ impl std::str::FromStr for ColorEncoding {
         };
 
         match name {
+            "classified" => {
+                ensure!(
+                    parameters.is_empty() && spec == "classified",
+                    "classified takes its colours from --color-map"
+                );
+                Ok(Self::Classified)
+            }
             "vector-field" => {
                 let [component_limit] = numbers(1)?[..] else {
                     unreachable!("the count was checked")
@@ -151,7 +184,7 @@ impl std::str::FromStr for ColorEncoding {
             }
             _ => bail!(
                 "unknown raster encoding {name:?}. Expected one of \
-                 vector-field:<component-limit>, scalar16:<min>,<max>, scalar24:<base>,<interval>"
+                 classified, vector-field:<component-limit>, scalar16:<min>,<max>, scalar24:<base>,<interval>"
             ),
         }
     }
@@ -205,7 +238,7 @@ impl ColorEncoding {
     /// How many bands the encoding consumes, in band order.
     pub(crate) fn bands(&self) -> usize {
         match self {
-            Self::Scalar24 { .. } | Self::Scalar16 { .. } => 1,
+            Self::Classified | Self::Scalar24 { .. } | Self::Scalar16 { .. } => 1,
             Self::VectorField { .. } => 2,
         }
     }
@@ -216,7 +249,7 @@ impl ColorEncoding {
     /// is called.
     fn required_bands(&self) -> Option<&'static [&'static str]> {
         match self {
-            Self::Scalar24 { .. } | Self::Scalar16 { .. } => None,
+            Self::Classified | Self::Scalar24 { .. } | Self::Scalar16 { .. } => None,
             // East-west first, north-south second, which is the order the
             // components are read in and the one the GRIB2 products use.
             Self::VectorField { .. } => Some(&["u", "v"]),
@@ -254,6 +287,7 @@ impl ColorEncoding {
     /// Whether encoding these values would saturate rather than represent them.
     fn clips(&self, values: [f64; 2]) -> bool {
         match *self {
+            Self::Classified => false,
             Self::Scalar24 { base, interval } => {
                 // Zero is a value here, not a reserved code: this encoding has
                 // no mask, so `base` itself has to be representable. Counting
@@ -274,11 +308,13 @@ impl ColorEncoding {
 
     /// The pixel written where the grid has no value.
     ///
-    /// Always opaque. For a vector field the components also sit at zero, so a
+    /// Classified output is transparent; data encodings are opaque. For a
+    /// vector field the components also sit at zero, so a
     /// client that ignores the mask sees calm air rather than a hard edge of
     /// maximum wind.
-    fn off_grid(&self) -> [u8; 4] {
+    pub(super) fn off_grid(&self) -> [u8; 4] {
         match self {
+            Self::Classified => [0; 4],
             Self::Scalar24 { .. } => [0, 0, 0, 255],
             Self::Scalar16 { .. } => [0, 0, 0, 255],
             Self::VectorField { .. } => [ZERO_CODE as u8, ZERO_CODE as u8, 0, 255],
@@ -286,11 +322,23 @@ impl ColorEncoding {
     }
 
     /// Encodes the physical values of one grid cell.
+    fn paint(&self, values: [f64; 2], spec: &TilesetSpec) -> [u8; 4] {
+        match self {
+            Self::Classified => spec
+                .color_map
+                .as_ref()
+                .expect("classified map validated before rendering")
+                .paint(values[0]),
+            _ => self.encode(values),
+        }
+    }
+
     fn encode(&self, values: [f64; 2]) -> [u8; 4] {
         if values[..self.bands()].iter().any(|value| value.is_nan()) {
             return self.off_grid();
         }
         match *self {
+            Self::Classified => unreachable!("classified pixels are painted with their colour map"),
             Self::Scalar24 { base, interval } => {
                 let code = normalize((values[0] - base) / interval, 0.0, SCALAR24_CODES) as u32;
                 [(code >> 16) as u8, (code >> 8) as u8, code as u8, 255]
@@ -316,6 +364,9 @@ impl ColorEncoding {
     /// without being told anything else.
     pub(crate) fn descriptor(&self) -> Value {
         match *self {
+            Self::Classified => {
+                json!({"encoding": "classified", "purpose": "display", "color_space": "srgb", "alpha": "straight", "decode": null, "mask": {"kind": "alpha", "missing": 0}})
+            }
             Self::Scalar24 { base, interval } => json!({
                 "encoding": "scalar-24",
                 "base": base,
@@ -399,7 +450,9 @@ fn signed_code(value: f64, component_limit: f64) -> u8 {
 /// reach.
 pub(crate) const TILE_BUFFER: u32 = 1;
 
-/// The side of the stored image: the tile plus its margin on both sides.
+/// The side of the stored image of a default tile: the tile plus its margin on
+/// both sides.
+#[cfg(test)]
 pub(crate) const IMAGE_EXTENT: u32 = TILE_EXTENT + 2 * TILE_BUFFER;
 
 /// The source grid of one tile, resampled onto a regular lattice.
@@ -643,8 +696,9 @@ pub(super) fn render_raster_tile(
     zxy: Zxy,
     deduped_points: &PointMap<(u32, u32), Point>,
     band_scales: &[BandScale<'_>],
-    encoding: ColorEncoding,
+    layout: RasterLayout,
 ) -> Result<Option<Vec<u8>>> {
+    let encoding = layout.encoding;
     let bands = encoding.bands();
     if band_scales.len() < bands {
         return Ok(None);
@@ -655,13 +709,14 @@ pub(super) fn render_raster_tile(
     // Matches the filter the metadata asks the client for: interpolating here
     // and then telling the client not to would put the invented values in the
     // tile anyway.
-    let interpolate = !band_scales
-        .iter()
-        .take(bands)
-        .any(|band| band.is_quantized());
+    let interpolate = encoding != ColorEncoding::Classified
+        && !band_scales
+            .iter()
+            .take(bands)
+            .any(|band| band.is_quantized());
 
     let spec = &tileset_spec.grid_spec;
-    let size = IMAGE_EXTENT as usize;
+    let size = layout.image_size() as usize;
     let mut pixels = encoding.off_grid().repeat(size * size);
     let mut covered = false;
 
@@ -672,9 +727,9 @@ pub(super) fn render_raster_tile(
     // byte-for-byte on the neighbour's copy of it. Working from the corner
     // rounds twice, and the seam disagreed by a code.
     let (z, tile_x, tile_y) = zxy;
-    let pixels_across = f64::from(TILE_EXTENT) * f64::from(1u32 << z);
+    let pixels_across = f64::from(layout.size) * f64::from(1u32 << z);
     let position = |tile: u32, index: usize| {
-        (f64::from(tile) * f64::from(TILE_EXTENT) + index as f64 + 0.5 - f64::from(TILE_BUFFER))
+        (f64::from(tile) * f64::from(layout.size) + index as f64 + 0.5 - f64::from(TILE_BUFFER))
             / pixels_across
     };
     // A whole turn of longitude, in grid coordinates, for the products whose
@@ -697,11 +752,15 @@ pub(super) fn render_raster_tile(
                 continue;
             };
 
-            let mut rgba = encoding.encode(values);
+            let mut rgba = encoding.paint(values, tileset_spec);
             if !on_grid {
                 // The value stays, so that a client filtering across the edge
                 // blends against real data; only the flag says it is outside.
-                rgba[2] = encoding.off_grid()[2];
+                if encoding == ColorEncoding::Classified {
+                    rgba = encoding.off_grid();
+                } else {
+                    rgba[2] = encoding.off_grid()[2];
+                }
             } else {
                 covered = true;
             }
@@ -713,14 +772,423 @@ pub(super) fn render_raster_tile(
     if !covered {
         return Ok(None);
     }
-    Ok(Some(encode_png(&pixels)?))
+    Ok(Some(encode_png(
+        &pixels,
+        layout.image_size(),
+        encoding == ColorEncoding::Classified,
+    )?))
 }
 
-fn encode_png(pixels: &[u8]) -> Result<Vec<u8>> {
+/// Whether a zoom aggregates the cells under each pixel rather than sampling
+/// the grid at pixel centres.
+///
+/// Wherever a cell is narrower or shorter than a pixel, sampling at centres
+/// skips some of the cells outright: a strip of heavy rain one cell high would
+/// come and go along the tile. So a zoom aggregates as soon as either axis is
+/// finer than a pixel anywhere in the product, which for latitude is where
+/// Mercator stretches it least. The decision is the product's, not the tile's,
+/// so that neighbouring tiles agree in the margin they share.
+pub(super) fn uses_pixel_aggregation(spec: &TilesetSpec, zxy: Zxy, tile_size: u32) -> bool {
+    let across = f64::from(tile_size) * f64::from(1u32 << zxy.0);
+    let grid = &spec.grid_spec;
+    let cell_width = across / (360.0 * f64::from(grid.lng_denom));
+    // The grid's own frame, not the cells that happen to be stored: one cell
+    // far away must not change how the rest of a time is drawn, and every
+    // time of a product has to draw alike. The frame runs from its origin
+    // away from it, so the origin is its latitude nearest the equator unless
+    // the frame crosses the equator going the other way.
+    let towards_equator = (grid.lat_0 > 0.0) != (grid.lat_denom > 0.0);
+    let least_stretched = if towards_equator || grid.lat_0 == 0.0 {
+        0.0
+    } else {
+        grid.lat_0.abs()
+    }
+    .min(MAX_MERCATOR_LATITUDE);
+    let half = 0.5 / f64::from(grid.lat_denom);
+    let cell_height = (crate::geo::lat_to_web_mercator_y(least_stretched - half)
+        - crate::geo::lat_to_web_mercator_y(least_stretched + half))
+    .abs()
+        * across;
+    cell_width < 1.0 || cell_height < 1.0
+}
+
+const MAX_MERCATOR_LATITUDE: f64 = 85.051_128_779_806_6;
+
+/// The basic cells a run of pixels along one axis covers, as `[low, high)` in
+/// grid coordinates, one entry per pixel.
+///
+/// A basic cell belongs to the pixel its centre falls in. A pixel narrower
+/// than a cell may hold no centre at all, and takes the cell under its own
+/// centre instead, so that every pixel over the grid has a value: aggregating
+/// where cells are smaller and sampling where they are larger.
+fn axis_ranges(edges: impl Iterator<Item = (f64, f64, f64)>) -> Vec<(i64, i64)> {
+    edges
+        .map(|(low, centre, high)| {
+            let (first, end) = (low.ceil() as i64, high.ceil() as i64);
+            if end > first {
+                (first, end)
+            } else {
+                let cell = (centre + 0.5).floor() as i64;
+                (cell, cell + 1)
+            }
+        })
+        .collect()
+}
+
+/// For each grid coordinate in `[origin, origin + len)`, the first and last
+/// pixel whose range holds it; `(u32::MAX, 0)` where none does.
+fn pixel_lookup(ranges: &[(i64, i64)], origin: i64, len: usize) -> Vec<(u32, u32)> {
+    let mut lookup = vec![(u32::MAX, 0); len];
+    for (pixel, &(first, end)) in ranges.iter().enumerate() {
+        for coordinate in first.max(origin)..end.min(origin + len as i64) {
+            let slot = &mut lookup[(coordinate - origin) as usize];
+            slot.0 = slot.0.min(pixel as u32);
+            slot.1 = slot.1.max(pixel as u32);
+        }
+    }
+    lookup
+}
+
+/// Renders a tile whose pixels each aggregate the basic cells they cover.
+///
+/// Coarse source cells count by how many basic cells of theirs fall in a
+/// pixel, without being expanded. These are grid-area statistics, not exact
+/// ground-area averages or exact polygon/pixel intersections.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn render_pixel_tile(
+    product: &crate::model::PreparedProduct,
+    zxy: Zxy,
+    chunks: &[&[(u64, crate::model::BaseTile)]],
+    scales: &[BandScale<'_>],
+    layout: RasterLayout,
+    level: u8,
+    work: &mut super::reduce::Workspace,
+) -> Result<Option<Vec<u8>>> {
+    let encoding = layout.encoding;
+    let spec = &product.spec;
+    let bands = encoding.bands();
+
+    let side = layout.image_size() as usize;
+    let corner = (
+        i64::from(zxy.2) * i64::from(layout.size) - i64::from(TILE_BUFFER),
+        i64::from(zxy.1) * i64::from(layout.size) - i64::from(TILE_BUFFER),
+    );
+    if let Some(pyramid) = nested_pyramid(product, level, corner, side) {
+        let mut rgba = encoding.off_grid().repeat(side * side);
+        let mut covered = false;
+        pyramid.window(level, corner, side, |row, column, raw| {
+            let mut values = [0.0; 2];
+            for (b, value) in values.iter_mut().enumerate().take(bands) {
+                match Some(raw[b])
+                    .filter(|raw| !raw.is_nan())
+                    .and_then(|raw| finish_raw(raw, b, spec, &scales[b]))
+                {
+                    Some(finished) => *value = finished,
+                    None => return,
+                }
+            }
+            let index = (row * side + column) * 4;
+            rgba[index..index + 4].copy_from_slice(&encoding.paint(values, spec));
+            covered = true;
+        });
+        if !covered {
+            return Ok(None);
+        }
+        return Ok(Some(encode_png(
+            &rgba,
+            layout.image_size(),
+            encoding == ColorEncoding::Classified,
+        )?));
+    }
+
+    let Some(size) = aggregate_pixels(
+        product,
+        zxy,
+        chunks,
+        PixelLattice {
+            across: layout.size,
+            margin: TILE_BUFFER,
+            bands,
+            every_band: true,
+            output: super::TileOutput::Raster(layout),
+        },
+        work,
+    ) else {
+        return Ok(None);
+    };
+    let super::reduce::Workspace {
+        entries,
+        scratch,
+        pixels,
+        methods,
+        capacities,
+        touched,
+    } = work;
+
+    let mut rgba = encoding.off_grid().repeat(size * size);
+    let mut covered = false;
+    for &index in touched.iter() {
+        let index = index as usize;
+        let capacity = capacities[index];
+        let mut values = [0.0; 2];
+        let mut present = true;
+        for (b, value) in values.iter_mut().enumerate().take(bands) {
+            match pixels[index * bands + b]
+                .finish(methods[index], capacity, spec.fill[b], entries, scratch)
+                .and_then(|raw| finish_raw(raw, b, spec, &scales[b]))
+            {
+                Some(finished) => *value = finished,
+                None => present = false,
+            }
+        }
+        if present {
+            rgba[index * 4..index * 4 + 4].copy_from_slice(&encoding.paint(values, spec));
+            covered = true;
+        }
+    }
+    if !covered {
+        return Ok(None);
+    }
+    Ok(Some(encode_png(
+        &rgba,
+        layout.image_size(),
+        encoding == ColorEncoding::Classified,
+    )?))
+}
+
+/// The product's pyramid, when it can stand in for gathering a window's
+/// cells: the pyramid holds the level, and every pixel of the window holds a
+/// cell centre on both axes, so that its statistic nests.
+///
+/// Which pixels hold a centre depends on the level and the pixel alone, so
+/// neighbouring tiles agree on the pixels they share whichever way they go.
+pub(super) fn nested_pyramid(
+    product: &crate::model::PreparedProduct,
+    level: u8,
+    (top, left): (i64, i64),
+    side: usize,
+) -> Option<&super::Pyramid> {
+    let pyramid = product.pyramid.as_ref()?;
+    if !pyramid.has_level(level) {
+        return None;
+    }
+    let grid = &product.spec.grid_spec;
+    let world = (1u64 << level) as f64;
+    let lng_grid =
+        |pixel: f64| (pixel / world * 360.0 - 180.0 - grid.lng_0) * f64::from(grid.lng_denom);
+    let lat_grid = |pixel: f64| {
+        let latitude = web_mercator_to_lnglat(0.0, pixel / world).1;
+        (latitude - grid.lat_0) * f64::from(grid.lat_denom)
+    };
+    let columns_nest = (0..side).all(|column| {
+        let column = (left + column as i64) as f64;
+        lng_grid(column + 1.0).ceil() > lng_grid(column).ceil()
+    });
+    let rows_nest = (0..side).all(|row| {
+        let row = (top + row as i64) as f64;
+        lat_grid(row).floor() > lat_grid(row + 1.0).floor()
+    });
+    (columns_nest && rows_nest).then_some(pyramid)
+}
+
+/// A tile's pixels: how many across it, how many more beyond each edge, and
+/// what each holds.
+pub(super) struct PixelLattice {
+    pub(super) across: u32,
+    pub(super) margin: u32,
+    pub(super) bands: usize,
+    /// Count a cell only where every band has a value, as the two components
+    /// of a vector field must; otherwise each band counts the cells it has.
+    pub(super) every_band: bool,
+    /// Which chunks the tile reads, for counting each cell once.
+    pub(super) output: super::TileOutput,
+}
+
+/// Gathers the cells under each pixel of a tile into `work`, and returns the
+/// side of the image, margin included, or `None` when no cell reaches it.
+///
+/// Coarse source cells count by how many basic cells of theirs fall in a
+/// pixel, without being expanded. These are grid-area statistics, not exact
+/// ground-area averages or exact polygon/pixel intersections.
+pub(super) fn aggregate_pixels(
+    product: &crate::model::PreparedProduct,
+    zxy: Zxy,
+    chunks: &[&[(u64, crate::model::BaseTile)]],
+    lattice: PixelLattice,
+    work: &mut super::reduce::Workspace,
+) -> Option<usize> {
+    let spec = &product.spec;
+    let grid = &spec.grid_spec;
+    let (z, tile_x, tile_y) = zxy;
+    let size = (lattice.across + 2 * lattice.margin) as usize;
+    let world = f64::from(lattice.across) * f64::from(1u32 << z);
+    let left = f64::from(tile_x) * f64::from(lattice.across) - f64::from(lattice.margin);
+    let top = f64::from(tile_y) * f64::from(lattice.across) - f64::from(lattice.margin);
+    let bands = lattice.bands;
+    let method = spec.reducer;
+
+    // Every range comes from the global pixel index, so adjacent tiles agree
+    // on membership, capacity and bytes in the margin they share.
+    let lng_grid =
+        |pixel: f64| (pixel / world * 360.0 - 180.0 - grid.lng_0) * f64::from(grid.lng_denom);
+    let lat_grid = |pixel: f64| {
+        let latitude = web_mercator_to_lnglat(0.0, pixel / world).1;
+        (latitude - grid.lat_0) * f64::from(grid.lat_denom)
+    };
+    // Rows run south as they go down the image, so the grid runs backwards.
+    // Rows run south down the image while the grid runs north. A row holds
+    // the cells whose centres lie above its south edge and up to its north
+    // edge, the same half-open rule as the columns read the other way.
+    let rows = axis_ranges((0..size).map(|row| {
+        let row = top + row as f64;
+        let (north, centre, south) = (lat_grid(row), lat_grid(row + 0.5), lat_grid(row + 1.0));
+        (south.floor() + 1.0, centre, north.floor() + 1.0)
+    }));
+
+    // Longitude names the same meridian three ways, and a product framed in
+    // 0..360 meets a tile asking in -180..180 a turn away. Each naming that
+    // reaches the product's columns gets its own ranges, taken straight from
+    // the shifted coordinates so that a turn need not be whole cells.
+    let turn = 360.0 * f64::from(grid.lng_denom);
+    let product_columns = (
+        ((spec.bounds[0] - grid.lng_0) * f64::from(grid.lng_denom)).floor() as i64 - 1,
+        ((spec.bounds[2] - grid.lng_0) * f64::from(grid.lng_denom)).ceil() as i64 + 1,
+    );
+    let namings = [0.0, turn, -turn]
+        .into_iter()
+        .filter_map(|shift| {
+            let ranges = axis_ranges((0..size).map(|column| {
+                let column = left + column as f64;
+                (
+                    lng_grid(column) + shift,
+                    lng_grid(column + 0.5) + shift,
+                    lng_grid(column + 1.0) + shift,
+                )
+            }));
+            let first = ranges.first()?.0.max(product_columns.0);
+            let end = ranges.last()?.1.min(product_columns.1);
+            (end > first).then(|| {
+                let lookup = pixel_lookup(&ranges, first, (end - first) as usize);
+                (ranges, first, lookup)
+            })
+        })
+        .collect::<Vec<_>>();
+    if namings.is_empty() {
+        return None;
+    }
+    let row_origin = rows.last().map_or(0, |range| range.0);
+    let row_end = rows.first().map_or(0, |range| range.1);
+    if row_end <= row_origin {
+        return None;
+    }
+    let row_lookup = pixel_lookup(&rows, row_origin, (row_end - row_origin) as usize);
+    let span = |ranges: &[(i64, i64)], pixel: u32| {
+        let (first, end) = ranges[pixel as usize];
+        (end - first) as u64
+    };
+    let overlap = |cell: i64, width: i64, (first, end): (i64, i64)| {
+        (end.min(cell + width) - first.max(cell)).max(0) as u64
+    };
+
+    work.reset_pixels(size * size, bands);
+    let super::reduce::Workspace {
+        entries,
+        scratch: _,
+        pixels,
+        methods,
+        capacities,
+        touched,
+    } = work;
+
+    let square = super::ChunkSquare::read_by(spec.base_z, zxy, lattice.output);
+    let mut read = chunks
+        .iter()
+        .flat_map(|chunk| chunk.iter())
+        .collect::<Vec<_>>();
+    read.sort_unstable_by_key(|(id, _)| *id);
+    read.dedup_by_key(|(id, _)| *id);
+    for &(id, tile) in &read {
+        let corner = fast_hilbert::h2xy::<u32>(*id, spec.base_z);
+        for (i, &(x, y)) in tile.point_positions.iter().enumerate() {
+            if !super::owns_cell(square, corner, tile, i) {
+                continue;
+            }
+            let present = |b: usize| tile.bands[b].values[i].get().is_some();
+            if if lattice.every_band {
+                !(0..bands).all(present)
+            } else {
+                !(0..bands).any(present)
+            } {
+                continue;
+            }
+            let width = 1i64 << tile.point_powers[i];
+            let (x, y) = (i64::from(x), i64::from(y));
+            // The rows and columns whose ranges reach the cell.
+            let reach = |lookup: &[(u32, u32)], origin: i64, low: i64| {
+                let mut found = (u32::MAX, 0u32);
+                for coordinate in low.max(origin)..(low + width).min(origin + lookup.len() as i64) {
+                    let (first, last) = lookup[(coordinate - origin) as usize];
+                    found = (found.0.min(first), found.1.max(last));
+                }
+                (found.0 <= found.1).then_some(found)
+            };
+            let Some((row_first, row_last)) = reach(&row_lookup, row_origin, y) else {
+                continue;
+            };
+            for (column_ranges, column_origin, column_lookup) in &namings {
+                let Some((column_first, column_last)) = reach(column_lookup, *column_origin, x)
+                else {
+                    continue;
+                };
+                for row in row_first..=row_last {
+                    let rows_in = overlap(y, width, rows[row as usize]);
+                    if rows_in == 0 {
+                        continue;
+                    }
+                    for column in column_first..=column_last {
+                        let columns_in = overlap(x, width, column_ranges[column as usize]);
+                        if columns_in == 0 {
+                            continue;
+                        }
+                        let index = row as usize * size + column as usize;
+                        let states = &mut pixels[index * bands..(index + 1) * bands];
+                        if capacities[index] == 0 {
+                            touched.push(index as u32);
+                            let capacity = span(&rows, row) * span(column_ranges, column);
+                            capacities[index] = capacity;
+                            methods[index] = super::reduce::effective_reducer(method, capacity);
+                        }
+                        for (b, state) in states.iter_mut().enumerate() {
+                            if let Some(value) = tile.bands[b].values[i].get() {
+                                state.add(value, columns_in * rows_in, methods[index], entries);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (!touched.is_empty()).then_some(size)
+}
+
+fn finish_raw(raw: f64, b: usize, spec: &TilesetSpec, scale: &BandScale<'_>) -> Option<f64> {
+    let value = crate::quantize::postprocess(raw, b, spec)?;
+    Some(if scale.is_quantized() {
+        scale.physical(value as i32)
+    } else {
+        (scale.reference + value * scale.binary_scale) * scale.decimal_scale
+    })
+}
+
+fn encode_png(pixels: &[u8], image_size: u32, display: bool) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
-    let mut encoder = png::Encoder::new(&mut buffer, IMAGE_EXTENT, IMAGE_EXTENT);
+    let mut encoder = png::Encoder::new(&mut buffer, image_size, image_size);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
+    if display {
+        encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+    }
     // Leaves the adaptive row filter this preset selects in place. A field is
     // smooth and its off-grid margin is constant, so the filters predict it
     // almost perfectly: measured over one archive, turning them off grew it
@@ -742,6 +1210,20 @@ fn encode_png(pixels: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_png_declares_srgb_while_data_png_keeps_exact_channels() {
+        for display in [false, true] {
+            let rgba = [17, 34, 51, 128];
+            let bytes = encode_png(&rgba, 1, display).unwrap();
+            let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+            let mut reader = decoder.read_info().unwrap();
+            assert_eq!(reader.info().srgb.is_some(), display);
+            let mut decoded = [0; 4];
+            reader.next_frame(&mut decoded).unwrap();
+            assert_eq!(decoded, rgba);
+        }
+    }
 
     /// A tiny client driven only by the descriptor JSON. Round-trip tests use
     /// this instead of matching on [`ColorEncoding`], so changing metadata
@@ -1245,6 +1727,7 @@ mod tests {
             let empty = decode(&descriptor, [0, 0, 0, 255])[0];
             let span = (full - empty).abs();
             let expected = match encoding {
+                ColorEncoding::Classified => unreachable!("data encodings only"),
                 ColorEncoding::Scalar24 { interval, .. } => SCALAR24_CODES * interval,
                 ColorEncoding::Scalar16 { min, max } => max - min,
                 ColorEncoding::VectorField { component_limit } => {
@@ -1338,7 +1821,7 @@ mod tests {
             }
         }
 
-        let png = encode_png(&pixels).unwrap();
+        let png = encode_png(&pixels, IMAGE_EXTENT, false).unwrap();
         assert!(
             png.len() < pixels.len() / 100,
             "expected the filters to flatten the tile, but {} bytes came out of {}",
@@ -1494,7 +1977,7 @@ mod tests {
             .repeat((IMAGE_EXTENT * IMAGE_EXTENT) as usize);
         pixels[..4].copy_from_slice(&[10, 200, 255, 255]);
 
-        let png = encode_png(&pixels).unwrap();
+        let png = encode_png(&pixels, IMAGE_EXTENT, false).unwrap();
         let decoder = png::Decoder::new(std::io::Cursor::new(&png));
         let mut reader = decoder.read_info().unwrap();
         let mut decoded = vec![0; reader.output_buffer_size().unwrap()];
