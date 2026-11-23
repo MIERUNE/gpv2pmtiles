@@ -448,39 +448,64 @@ impl Partial {
 }
 
 /// A pixel's percentile from the stored values under it, as `(value, weight)`
-/// sorted by value with each value once, exactly as [`Accumulator::finish`]
-/// gives it for the same cells. `entries` and `scratch` are reused buffers.
+/// sorted by value with each value once: what [`Accumulator::finish`] gives
+/// for the same cells, read off the running weight instead of selected.
 pub(super) fn finish_histogram(
     histogram: &[(i32, u64)],
     reducer: Reducer,
     capacity: u64,
     fill: Option<i32>,
-    entries: &mut Vec<Entry>,
-    scratch: &mut BlockSamples,
 ) -> Option<f64> {
     let (&(min, _), &(max, _)) = (histogram.first()?, histogram.last()?);
-    entries.clear();
-    let mut accumulator = Accumulator {
-        min,
-        max,
-        ..Accumulator::default()
+    let weight = histogram.iter().map(|&(_, weight)| weight).sum::<u64>();
+    let missing = if fill.is_some() {
+        capacity.saturating_sub(weight)
+    } else {
+        0
     };
-    for &(value, weight) in histogram {
-        accumulator.weight += weight;
-        entries.push(Entry {
-            value,
-            weight,
-            next: accumulator.head,
-        });
-        accumulator.head = (entries.len() - 1) as u32;
-    }
-    accumulator.finish(
-        effective_reducer(reducer, capacity),
-        capacity,
-        fill,
-        entries,
-        scratch,
-    )
+    let fill = fill.filter(|_| missing > 0);
+    let value = match effective_reducer(reducer, capacity) {
+        Reducer::Max => fill.map_or(max, |fill| max.max(fill)),
+        Reducer::Min => fill.map_or(min, |fill| min.min(fill)),
+        Reducer::Percentile(fraction) => {
+            let total = weight + missing;
+            let rank = ((u128::from(fraction.numerator) * u128::from(total))
+                .div_ceil(u128::from(fraction.denominator)) as u64)
+                .max(1);
+            // The fill joins the stored values at its place in their order.
+            let mut fill = fill.map(|fill| (fill, missing));
+            let mut running = 0;
+            let mut found = max;
+            for &(value, weight) in histogram {
+                if let Some((filled, missing)) = fill.filter(|&(filled, _)| filled < value) {
+                    running += missing;
+                    fill = None;
+                    if running >= rank {
+                        found = filled;
+                        break;
+                    }
+                }
+                let weight = if fill.is_some_and(|(filled, _)| filled == value) {
+                    weight + fill.take().unwrap().1
+                } else {
+                    weight
+                };
+                running += weight;
+                if running >= rank {
+                    found = value;
+                    break;
+                }
+            }
+            if running < rank
+                && let Some((filled, _)) = fill
+            {
+                found = filled;
+            }
+            found
+        }
+        Reducer::Mean | Reducer::BitOr => unreachable!("only a percentile keeps a histogram"),
+    };
+    Some(f64::from(value))
 }
 
 pub(super) fn effective_reducer(reducer: Reducer, capacity: u64) -> Reducer {
@@ -586,6 +611,49 @@ fn median_of_three(a: i32, b: i32, c: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    /// Reading a histogram's running weight gives what the accumulator gives
+    /// for the same cells, fill and all: below, among, on and above the
+    /// stored values, at every rank.
+    #[test]
+    fn a_histogram_finishes_as_the_accumulator_does() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        let mut entries = Vec::new();
+        let mut scratch = BlockSamples::default();
+        for case in 0..20_000 {
+            let len = 1 + next(6) as usize;
+            let mut histogram = Vec::new();
+            let mut value = next(5) as i32 - 2;
+            for _ in 0..len {
+                histogram.push((value, 1 + next(9)));
+                value += 1 + next(3) as i32;
+            }
+            let weight = histogram.iter().map(|&(_, weight)| weight).sum::<u64>();
+            let capacity = weight + next(12);
+            let fill = (next(3) > 0).then(|| next(16) as i32 - 4);
+            let percent = [0, 1, 5, 25, 50, 75, 95, 99, 100][next(9) as usize];
+            let reducer: Reducer = format!("p{percent}").parse().unwrap();
+
+            let method = effective_reducer(reducer, capacity);
+            let mut accumulator = Accumulator::default();
+            entries.clear();
+            for &(value, weight) in &histogram {
+                accumulator.add(value, weight, method, &mut entries);
+            }
+            let expected = accumulator.finish(method, capacity, fill, &entries, &mut scratch);
+            assert_eq!(
+                finish_histogram(&histogram, reducer, capacity, fill),
+                expected,
+                "case {case}: {histogram:?} capacity {capacity} fill {fill:?} p{percent}"
+            );
+        }
+    }
+
     use super::*;
 
     fn reference(samples: &[(i32, u64)], rank: u64) -> i32 {

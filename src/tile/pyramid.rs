@@ -144,15 +144,8 @@ impl Pyramid {
                 product,
                 (coarsest, finest),
                 finest_level,
-                |histograms, slot, capacity, fill, (entries, scratch)| {
-                    super::reduce::finish_histogram(
-                        histograms.get(slot),
-                        reducer,
-                        capacity,
-                        fill,
-                        entries,
-                        scratch,
-                    )
+                |histograms: &Histograms, slot, capacity, fill, _: &mut ()| {
+                    super::reduce::finish_histogram(histograms.get(slot), reducer, capacity, fill)
                 },
                 |finer| halve_histograms(finer, bands),
             )
@@ -295,23 +288,62 @@ impl Histograms {
     }
 
     /// From `(slot, value, weight)` in any order, repeats allowed.
-    fn from_unsorted(mut items: Vec<(u32, i32, u64)>, slots: usize) -> Self {
-        items.sort_unstable_by_key(|&(slot, value, _)| (slot, value));
-        let mut offsets = Vec::with_capacity(slots + 1);
-        let mut entries: Vec<(i32, u64)> = Vec::with_capacity(items.len());
-        let mut items = items.into_iter().peekable();
-        for slot in 0..slots as u32 {
-            offsets.push(entries.len() as u32);
+    fn from_unsorted(items: Vec<(u32, i32, u64)>, slots: usize) -> Self {
+        // Bucketed by slot first, which leaves a few values to order in each.
+        let mut offsets = vec![0u32; slots + 1];
+        for &(slot, ..) in &items {
+            offsets[slot as usize + 1] += 1;
+        }
+        for slot in 0..slots {
+            offsets[slot + 1] += offsets[slot];
+        }
+        let mut next = offsets.clone();
+        let mut bucketed = vec![(0, 0); items.len()];
+        for (slot, value, weight) in items {
+            bucketed[next[slot as usize] as usize] = (value, weight);
+            next[slot as usize] += 1;
+        }
+        let mut entries: Vec<(i32, u64)> = Vec::with_capacity(bucketed.len());
+        for slot in 0..slots {
+            let bucket = &mut bucketed[offsets[slot] as usize..offsets[slot + 1] as usize];
+            bucket.sort_unstable_by_key(|&(value, _)| value);
+            offsets[slot] = entries.len() as u32;
             let first = entries.len();
-            while let Some((_, value, weight)) = items.next_if(|item| item.0 == slot) {
+            for &(value, weight) in bucket.iter() {
                 match entries[first..].last_mut() {
                     Some(last) if last.0 == value => last.1 += weight,
                     _ => entries.push((value, weight)),
                 }
             }
         }
-        offsets.push(entries.len() as u32);
+        offsets[slots] = entries.len() as u32;
+        entries.shrink_to_fit();
         Self { offsets, entries }
+    }
+}
+
+/// Merges sorted `(value, weight)` lists into `out`, each value once with its
+/// weights added.
+fn merge_sorted(lists: &mut [&[(i32, u64)]], out: &mut Vec<(i32, u64)>) {
+    loop {
+        let Some(value) = lists
+            .iter()
+            .filter_map(|list| list.first())
+            .map(|e| e.0)
+            .min()
+        else {
+            return;
+        };
+        let mut weight = 0;
+        for list in lists.iter_mut() {
+            if let Some(&(head, add)) = list.first()
+                && head == value
+            {
+                weight += add;
+                *list = &list[1..];
+            }
+        }
+        out.push((value, weight));
     }
 }
 
@@ -325,37 +357,40 @@ fn halve_histograms(finer: &Blocks<Histograms>, bands: usize) -> Blocks<Histogra
         .collect::<Vec<_>>();
     parents.sort_unstable();
     parents.dedup();
+    const HALF: usize = BLOCK / 2;
     Blocks::from_blocks(
         parents
             .into_par_iter()
             .map(|parent| {
-                let mut items = Vec::new();
-                for (down, across) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
-                    let Some(child) = finer.get((2 * parent.0 + down, 2 * parent.1 + across))
-                    else {
-                        continue;
-                    };
-                    let (quadrant_row, quadrant_column) =
-                        (down as usize * BLOCK / 2, across as usize * BLOCK / 2);
-                    for row in 0..BLOCK {
-                        let out_row = quadrant_row + row / 2;
-                        for column in 0..BLOCK {
-                            let from = (row * BLOCK + column) * bands;
-                            let to = (out_row * BLOCK + quadrant_column + column / 2) * bands;
-                            for band in 0..bands {
-                                items.extend(
-                                    child.get(from + band).iter().map(|&(value, weight)| {
-                                        ((to + band) as u32, value, weight)
-                                    }),
-                                );
-                            }
+                let children = [(0, 0), (0, 1), (1, 0), (1, 1)]
+                    .map(|(down, across)| finer.get((2 * parent.0 + down, 2 * parent.1 + across)));
+                let bound = children.iter().flatten().map(|c| c.entries.len()).sum();
+                let mut offsets = Vec::with_capacity(BLOCK * BLOCK * bands + 1);
+                let mut entries = Vec::with_capacity(bound);
+                for row in 0..BLOCK {
+                    for column in 0..BLOCK {
+                        let child = children[(row / HALF) * 2 + column / HALF];
+                        let (row, column) = (2 * (row % HALF), 2 * (column % HALF));
+                        for band in 0..bands {
+                            offsets.push(entries.len() as u32);
+                            let Some(child) = child else { continue };
+                            let slot =
+                                |r: usize, c: usize| child.get((r * BLOCK + c) * bands + band);
+                            merge_sorted(
+                                &mut [
+                                    slot(row, column),
+                                    slot(row, column + 1),
+                                    slot(row + 1, column),
+                                    slot(row + 1, column + 1),
+                                ],
+                                &mut entries,
+                            );
                         }
                     }
                 }
-                (
-                    parent,
-                    Histograms::from_unsorted(items, BLOCK * BLOCK * bands),
-                )
+                offsets.push(entries.len() as u32);
+                entries.shrink_to_fit();
+                (parent, Histograms { offsets, entries })
             })
             .collect(),
     )
