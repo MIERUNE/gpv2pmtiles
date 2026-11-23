@@ -10,8 +10,11 @@
 //! Gathering the cells once, at the finest level any zoom asks for, and
 //! halving from there gives every coarser level without reading a cell again.
 //!
-//! A percentile cannot be recovered from the percentiles below it, and still
-//! gathers from the cells.
+//! A percentile cannot be recovered from the percentiles below it, so for one
+//! a pixel keeps how much of its area each stored value covers instead
+//! ([`Histograms`]): the four under it add up the same way, and the value at
+//! the rank is picked once the level is reached. The values are the raw
+//! integers the grid stores, so nothing is binned or approximated.
 //!
 //! A pixel that holds no cell centre - where a cell is wider or taller than a
 //! pixel - takes the cell under its own centre instead, which does not nest.
@@ -40,14 +43,14 @@ const BLOCK_SHIFT: u32 = 6;
 const BLOCK: usize = 1 << BLOCK_SHIFT;
 const BLOCK_MASK: i64 = BLOCK as i64 - 1;
 
-/// Blocks of `BLOCK` × `BLOCK` pixels, each holding `bands` values per pixel
-/// row by row, found by their global block row and column.
-struct Blocks<T> {
+/// Blocks of `BLOCK` × `BLOCK` pixels, each holding the state of `bands`
+/// slots per pixel row by row, found by their global block row and column.
+struct Blocks<B> {
     index: HashMap<(i64, i64), usize>,
-    blocks: Vec<((i64, i64), Vec<T>)>,
+    blocks: Vec<((i64, i64), B)>,
 }
 
-impl<T> Default for Blocks<T> {
+impl<B> Default for Blocks<B> {
     fn default() -> Self {
         Self {
             index: HashMap::default(),
@@ -56,12 +59,12 @@ impl<T> Default for Blocks<T> {
     }
 }
 
-impl<T> Blocks<T> {
-    fn get(&self, key: (i64, i64)) -> Option<&[T]> {
-        self.index.get(&key).map(|&at| self.blocks[at].1.as_slice())
+impl<B> Blocks<B> {
+    fn get(&self, key: (i64, i64)) -> Option<&B> {
+        self.index.get(&key).map(|&at| &self.blocks[at].1)
     }
 
-    fn from_blocks(blocks: Vec<((i64, i64), Vec<T>)>) -> Self {
+    fn from_blocks(blocks: Vec<((i64, i64), B)>) -> Self {
         let index = blocks
             .iter()
             .enumerate()
@@ -75,7 +78,7 @@ pub(crate) struct Pyramid {
     /// Levels from `first` up; `levels[i]` is level `first + i`. A pixel
     /// holds its finished value per band, NaN where it has none.
     first: u8,
-    levels: Vec<Blocks<f64>>,
+    levels: Vec<Blocks<Vec<f64>>>,
     bands: usize,
 }
 
@@ -97,11 +100,6 @@ impl std::fmt::Debug for Pyramid {
 }
 
 impl Pyramid {
-    /// Whether a pyramid can hold the statistic.
-    pub(crate) fn supports(reducer: Reducer) -> bool {
-        Partial::supports(reducer)
-    }
-
     /// Gathers the product's cells into level `finest` and halves down to
     /// `coarsest`.
     ///
@@ -116,43 +114,67 @@ impl Pyramid {
         let spec = &product.spec;
         let bands = spec.band_specs.len();
         let reducer = spec.reducer;
-        let (max_x, max_y) = grid_extent(product);
-        let mut partials = gather(product, finest, (max_x, max_y), every_band);
-        let mut levels = Vec::new();
-        for level in (coarsest..=finest).rev() {
-            let columns = Axis::columns(&spec.grid_spec, level, max_x);
-            let rows = Axis::rows(&spec.grid_spec, level, max_y);
-            levels.push(Blocks::from_blocks(
-                partials
+        let extent = grid_extent(product);
+        let levels = if let Reducer::Percentile(_) = reducer {
+            let finest_level = gather(
+                product,
+                finest,
+                extent,
+                every_band,
+                Vec::new,
+                |block: &mut Vec<(u32, i32, u64)>, slot, value| {
+                    // A cell covers its basic cells in runs along a row, and
+                    // most of a run lands in one pixel.
+                    match block.last_mut() {
+                        Some(last) if last.0 == slot as u32 && last.1 == value => last.2 += 1,
+                        _ => block.push((slot as u32, value, 1)),
+                    }
+                },
+            );
+            let finest_level = Blocks::from_blocks(
+                finest_level
                     .blocks
-                    .par_iter()
-                    .map(|&(key, ref block)| {
-                        let mut out = vec![f64::NAN; block.len()];
-                        for row in 0..BLOCK {
-                            let height = rows.span(key.0 * BLOCK as i64 + row as i64);
-                            for column in 0..BLOCK {
-                                let width = columns.span(key.1 * BLOCK as i64 + column as i64);
-                                let at = (row * BLOCK + column) * bands;
-                                for band in 0..bands {
-                                    if let Some(value) = block[at + band].finish(
-                                        reducer,
-                                        height * width,
-                                        spec.fill[band],
-                                    ) {
-                                        out[at + band] = value;
-                                    }
-                                }
-                            }
-                        }
-                        (key, out)
+                    .into_par_iter()
+                    .map(|(key, block)| {
+                        (key, Histograms::from_unsorted(block, BLOCK * BLOCK * bands))
                     })
                     .collect(),
-            ));
-            if level > coarsest {
-                partials = halve(&partials, bands, reducer);
-            }
-        }
-        levels.reverse();
+            );
+            finish_levels(
+                product,
+                (coarsest, finest),
+                finest_level,
+                |histograms, slot, capacity, fill, (entries, scratch)| {
+                    super::reduce::finish_histogram(
+                        histograms.get(slot),
+                        reducer,
+                        capacity,
+                        fill,
+                        entries,
+                        scratch,
+                    )
+                },
+                |finer| halve_histograms(finer, bands),
+            )
+        } else {
+            let finest_level = gather(
+                product,
+                finest,
+                extent,
+                every_band,
+                || vec![Partial::default(); BLOCK * BLOCK * bands],
+                |block: &mut Vec<Partial>, slot, value| block[slot].add(value, 1, reducer),
+            );
+            finish_levels(
+                product,
+                (coarsest, finest),
+                finest_level,
+                |block: &Vec<Partial>, slot, capacity, fill, _: &mut ()| {
+                    block[slot].finish(reducer, capacity, fill)
+                },
+                |finer| halve(finer, bands, reducer),
+            )
+        };
         Self {
             first: coarsest,
             levels,
@@ -204,6 +226,139 @@ impl Pyramid {
             }
         }
     }
+}
+
+/// Finishes every level from `finest` down to `coarsest`, halving the partial
+/// state between them, and returns the levels coarsest first. A level's state
+/// lives only until the next one is made from it.
+fn finish_levels<T: Sync + Send, S: Default>(
+    product: &PreparedProduct,
+    (coarsest, finest): (u8, u8),
+    mut state: Blocks<T>,
+    finish: impl Fn(&T, usize, u64, Option<i32>, &mut S) -> Option<f64> + Sync,
+    halve: impl Fn(&Blocks<T>) -> Blocks<T>,
+) -> Vec<Blocks<Vec<f64>>> {
+    let spec = &product.spec;
+    let bands = spec.band_specs.len();
+    let (max_x, max_y) = grid_extent(product);
+    let mut levels = Vec::new();
+    for level in (coarsest..=finest).rev() {
+        let columns = Axis::columns(&spec.grid_spec, level, max_x);
+        let rows = Axis::rows(&spec.grid_spec, level, max_y);
+        levels.push(Blocks::from_blocks(
+            state
+                .blocks
+                .par_iter()
+                .map_init(S::default, |scratch, &(key, ref block)| {
+                    let mut out = vec![f64::NAN; BLOCK * BLOCK * bands];
+                    for row in 0..BLOCK {
+                        let height = rows.span(key.0 * BLOCK as i64 + row as i64);
+                        for column in 0..BLOCK {
+                            let width = columns.span(key.1 * BLOCK as i64 + column as i64);
+                            let at = (row * BLOCK + column) * bands;
+                            for band in 0..bands {
+                                if let Some(value) = finish(
+                                    block,
+                                    at + band,
+                                    height * width,
+                                    spec.fill[band],
+                                    scratch,
+                                ) {
+                                    out[at + band] = value;
+                                }
+                            }
+                        }
+                    }
+                    (key, out)
+                })
+                .collect(),
+        ));
+        if level > coarsest {
+            state = halve(&state);
+        }
+    }
+    levels.reverse();
+    levels
+}
+
+/// The stored values under each pixel of a block and the area each covers,
+/// for a percentile: slot `s` (pixel × bands + band) holds
+/// `entries[offsets[s]..offsets[s + 1]]`, sorted by value, each value once.
+struct Histograms {
+    offsets: Vec<u32>,
+    entries: Vec<(i32, u64)>,
+}
+
+impl Histograms {
+    fn get(&self, slot: usize) -> &[(i32, u64)] {
+        &self.entries[self.offsets[slot] as usize..self.offsets[slot + 1] as usize]
+    }
+
+    /// From `(slot, value, weight)` in any order, repeats allowed.
+    fn from_unsorted(mut items: Vec<(u32, i32, u64)>, slots: usize) -> Self {
+        items.sort_unstable_by_key(|&(slot, value, _)| (slot, value));
+        let mut offsets = Vec::with_capacity(slots + 1);
+        let mut entries: Vec<(i32, u64)> = Vec::with_capacity(items.len());
+        let mut items = items.into_iter().peekable();
+        for slot in 0..slots as u32 {
+            offsets.push(entries.len() as u32);
+            let first = entries.len();
+            while let Some((_, value, weight)) = items.next_if(|item| item.0 == slot) {
+                match entries[first..].last_mut() {
+                    Some(last) if last.0 == value => last.1 += weight,
+                    _ => entries.push((value, weight)),
+                }
+            }
+        }
+        offsets.push(entries.len() as u32);
+        Self { offsets, entries }
+    }
+}
+
+/// [`halve`] for histograms: each pixel's values are those of the four under
+/// it, with the weights of a value they share added.
+fn halve_histograms(finer: &Blocks<Histograms>, bands: usize) -> Blocks<Histograms> {
+    let mut parents = finer
+        .index
+        .keys()
+        .map(|&(row, column)| (row >> 1, column >> 1))
+        .collect::<Vec<_>>();
+    parents.sort_unstable();
+    parents.dedup();
+    Blocks::from_blocks(
+        parents
+            .into_par_iter()
+            .map(|parent| {
+                let mut items = Vec::new();
+                for (down, across) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                    let Some(child) = finer.get((2 * parent.0 + down, 2 * parent.1 + across))
+                    else {
+                        continue;
+                    };
+                    let (quadrant_row, quadrant_column) =
+                        (down as usize * BLOCK / 2, across as usize * BLOCK / 2);
+                    for row in 0..BLOCK {
+                        let out_row = quadrant_row + row / 2;
+                        for column in 0..BLOCK {
+                            let from = (row * BLOCK + column) * bands;
+                            let to = (out_row * BLOCK + quadrant_column + column / 2) * bands;
+                            for band in 0..bands {
+                                items.extend(
+                                    child.get(from + band).iter().map(|&(value, weight)| {
+                                        ((to + band) as u32, value, weight)
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                }
+                (
+                    parent,
+                    Histograms::from_unsorted(items, BLOCK * BLOCK * bands),
+                )
+            })
+            .collect(),
+    )
 }
 
 /// The basic columns and rows the product's cells reach.
@@ -295,23 +450,25 @@ impl Axis {
     }
 }
 
-/// The partial statistics of level `level`, gathered from the cells.
-fn gather(
+/// The partial state of level `level`, gathered from the cells: `add` takes
+/// a block, the slot of a pixel's band in it and one basic cell's value.
+fn gather<T>(
     product: &PreparedProduct,
     level: u8,
     (max_x, max_y): (usize, usize),
     every_band: bool,
-) -> Blocks<Partial> {
+    new_block: impl Fn() -> T,
+    mut add: impl FnMut(&mut T, usize, i32),
+) -> Blocks<T> {
     let spec = &product.spec;
     let bands = spec.band_specs.len();
-    let reducer = spec.reducer;
     let column_of = Axis::columns(&spec.grid_spec, level, max_x).owner;
     let row_of = Axis::rows(&spec.grid_spec, level, max_y).owner;
 
     // Every cell once: the copy in the chunk that holds its centre. The cells
     // of a chunk run in Hilbert order, so consecutive ones mostly share a
     // block, and the last one found is kept at hand.
-    let mut level = Blocks::<Partial>::default();
+    let mut level = Blocks::<T>::default();
     let mut last_key = (i64::MIN, i64::MIN);
     let mut last_block = 0;
     for (_, tile) in &product.chunks {
@@ -345,9 +502,7 @@ fn gather(
                         let next = level.blocks.len();
                         last_block = *level.index.entry(key).or_insert(next);
                         if last_block == next {
-                            level
-                                .blocks
-                                .push((key, vec![Partial::default(); BLOCK * BLOCK * bands]));
+                            level.blocks.push((key, new_block()));
                         }
                     }
                     let block = &mut level.blocks[last_block].1;
@@ -355,7 +510,7 @@ fn gather(
                         * bands;
                     for band in 0..bands {
                         if let Some(value) = tile.bands[band].values[index].get() {
-                            block[at + band].add(value, 1, reducer);
+                            add(block, at + band, value);
                         }
                     }
                 }
@@ -367,7 +522,7 @@ fn gather(
 
 /// The level one coarser than `finer`: each pixel merges the four under it.
 /// A block's four children fill one quadrant each.
-fn halve(finer: &Blocks<Partial>, bands: usize, reducer: Reducer) -> Blocks<Partial> {
+fn halve(finer: &Blocks<Vec<Partial>>, bands: usize, reducer: Reducer) -> Blocks<Vec<Partial>> {
     let mut parents = finer
         .index
         .keys()

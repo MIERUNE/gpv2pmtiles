@@ -1092,23 +1092,16 @@ mod tests {
             ("mean", Some(0)),
             ("avg", None),
             ("bit-or", Some(64)),
+            ("p95", None),
+            ("p95", Some(0)),
+            ("p50", Some(7)),
+            ("p99.5", None),
+            ("p0", Some(3)),
+            ("p100", None),
         ] {
             compared += pyramid_matches_cells(reducer, fill);
         }
         assert!(compared > 100, "{compared}");
-
-        let mut product = mixed_product();
-        product.spec.reducer = "p95".parse().unwrap();
-        crate::archive::build_pyramid(
-            &mut product,
-            0,
-            10,
-            TileOutput::Raster(RasterLayout::new(ColorEncoding::Scalar16 {
-                min: -20.0,
-                max: 60.0,
-            })),
-        );
-        assert!(product.pyramid.is_none());
     }
 
     /// Draws tiles round one spot with the pyramid and without, and returns

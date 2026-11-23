@@ -259,9 +259,6 @@ pub(crate) fn build_pyramid(
     max_zoom: u8,
     output: TileOutput,
 ) {
-    if !crate::tile::Pyramid::supports(product.spec.reducer) {
-        return;
-    }
     let levels = (min_zoom..=max_zoom)
         .filter_map(|zoom| crate::tile::lattice_level(product, zoom, output))
         .collect::<Vec<_>>();

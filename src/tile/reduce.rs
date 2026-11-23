@@ -397,11 +397,6 @@ pub(crate) struct Partial {
 }
 
 impl Partial {
-    /// Whether `reducer` reduces to a [`Partial`].
-    pub(crate) fn supports(reducer: Reducer) -> bool {
-        !matches!(reducer, Reducer::Percentile(_))
-    }
-
     pub(crate) fn add(&mut self, value: i32, weight: u64, reducer: Reducer) {
         self.merge(
             Self {
@@ -450,6 +445,42 @@ impl Partial {
         }
         accumulator.finish(reducer, capacity, fill, &[], &mut BlockSamples::default())
     }
+}
+
+/// A pixel's percentile from the stored values under it, as `(value, weight)`
+/// sorted by value with each value once, exactly as [`Accumulator::finish`]
+/// gives it for the same cells. `entries` and `scratch` are reused buffers.
+pub(super) fn finish_histogram(
+    histogram: &[(i32, u64)],
+    reducer: Reducer,
+    capacity: u64,
+    fill: Option<i32>,
+    entries: &mut Vec<Entry>,
+    scratch: &mut BlockSamples,
+) -> Option<f64> {
+    let (&(min, _), &(max, _)) = (histogram.first()?, histogram.last()?);
+    entries.clear();
+    let mut accumulator = Accumulator {
+        min,
+        max,
+        ..Accumulator::default()
+    };
+    for &(value, weight) in histogram {
+        accumulator.weight += weight;
+        entries.push(Entry {
+            value,
+            weight,
+            next: accumulator.head,
+        });
+        accumulator.head = (entries.len() - 1) as u32;
+    }
+    accumulator.finish(
+        effective_reducer(reducer, capacity),
+        capacity,
+        fill,
+        entries,
+        scratch,
+    )
 }
 
 pub(super) fn effective_reducer(reducer: Reducer, capacity: u64) -> Reducer {
