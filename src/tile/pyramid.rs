@@ -143,6 +143,7 @@ impl Pyramid {
             finish_levels(
                 product,
                 (coarsest, finest),
+                extent,
                 finest_level,
                 |histograms: &Histograms, slot, capacity, fill, _: &mut ()| {
                     super::reduce::finish_histogram(histograms.get(slot), reducer, capacity, fill)
@@ -161,6 +162,7 @@ impl Pyramid {
             finish_levels(
                 product,
                 (coarsest, finest),
+                extent,
                 finest_level,
                 |block: &Vec<Partial>, slot, capacity, fill, _: &mut ()| {
                     block[slot].finish(reducer, capacity, fill)
@@ -227,13 +229,13 @@ impl Pyramid {
 fn finish_levels<T: Sync + Send, S: Default>(
     product: &PreparedProduct,
     (coarsest, finest): (u8, u8),
+    (max_x, max_y): (usize, usize),
     mut state: Blocks<T>,
     finish: impl Fn(&T, usize, u64, Option<i32>, &mut S) -> Option<f64> + Sync,
     halve: impl Fn(&Blocks<T>) -> Blocks<T>,
 ) -> Vec<Blocks<Vec<f64>>> {
     let spec = &product.spec;
     let bands = spec.band_specs.len();
-    let (max_x, max_y) = grid_extent(product);
     let mut levels = Vec::new();
     for level in (coarsest..=finest).rev() {
         let columns = Axis::columns(&spec.grid_spec, level, max_x);
