@@ -1252,8 +1252,10 @@ fn traverse_tile_pyramid(
                     for layer in layers {
                         protobuf.extend_from_slice(&layer);
                     }
+                    // Level 7 keeps most of what 9 saves over the default 6
+                    // (about 3% of the archive) for a fraction of its time.
                     let mut encoder =
-                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(7));
                     encoder.write_all(&protobuf)?;
                     encoder.finish()?
                 }
