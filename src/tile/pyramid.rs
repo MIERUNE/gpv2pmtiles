@@ -503,8 +503,8 @@ fn gather<T>(
     let row_of = Axis::rows(&spec.grid_spec, level, max_y).owner;
 
     // Every cell once: the copy in the chunk that holds its centre. The cells
-    // of a chunk run in Hilbert order, so consecutive ones mostly share a
-    // block, and the last one found is kept at hand.
+    // of a chunk run row by row, so consecutive ones mostly share a block,
+    // and the last one found is kept at hand.
     let mut level = Blocks::<T>::default();
     let mut last_key = (i64::MIN, i64::MIN);
     let mut last_block = 0;

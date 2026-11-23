@@ -104,12 +104,36 @@ pub(crate) fn prepare_product(
             "source band index out of range"
         );
     }
-    product_data.points.par_iter_mut().for_each(|point| {
-        point.point_id = xy2h(point.x as u32, point.y as u32, 16) as u32;
-    });
-    product_data
-        .points
-        .par_sort_unstable_by_key(|point| point.point_id);
+    // Two stable counting passes: x, then y. Bands at one origin stay together.
+    for coordinate in [false, true] {
+        let mut offsets = vec![0usize; 65536];
+        for point in &product_data.points {
+            offsets[usize::from(if coordinate { point.y } else { point.x })] += 1;
+        }
+        let mut sum = 0;
+        for count in &mut offsets {
+            let next = sum + *count;
+            *count = sum;
+            sum = next;
+        }
+        let mut sorted = (0..product_data.points.len())
+            .map(|_| gpv_products::products::PointValue {
+                x: 0,
+                y: 0,
+                point_id: 0,
+                point_power: 0,
+                band_idx: 0,
+                value: 0,
+            })
+            .collect::<Vec<_>>();
+        for mut point in product_data.points.drain(..) {
+            let key = usize::from(if coordinate { point.y } else { point.x });
+            point.point_id = (u32::from(point.y) << 16) | u32::from(point.x);
+            sorted[offsets[key]] = point;
+            offsets[key] += 1;
+        }
+        product_data.points = sorted;
+    }
 
     let mut min_lng = f64::MAX;
     let mut max_lng = f64::MIN;
@@ -148,21 +172,38 @@ pub(crate) fn prepare_product(
         .map(|&lat| lat_to_web_mercator_y(lat))
         .collect::<Vec<_>>();
 
-    let mut previous_end = 0u64;
+    // Sparse 64x64 occupancy bitmaps. Allocate only touched squares, and only
+    // for strict validation. Origin groups insert their footprint once.
+    let mut occupied = HashMap::<(u32, u32), Box<[u64; 64]>>::default();
     for point_bands in product_data
         .points
         .chunk_by(|left, right| left.point_id == right.point_id)
     {
         let point = point_bands.first().expect("point group is not empty");
-        let area = 1u64 << (2 * point.point_power);
-        let interval_start = u64::from(point.point_id) & !(area - 1);
-        ensure!(
-            !strict || interval_start >= previous_end,
-            "overlapping source cells at ({}, {})",
-            point.x,
-            point.y
-        );
-        previous_end = previous_end.max(interval_start + area);
+        if strict {
+            let width = 1u32 << point.point_power;
+            let x0 = u32::from(point.x);
+            let x1 = x0 + width;
+            let y0 = u32::from(point.y);
+            for y in y0..y0 + width {
+                for bx in x0 / 64..=(x1 - 1) / 64 {
+                    let left = x0.saturating_sub(bx * 64);
+                    let right = (x1 - bx * 64).min(64);
+                    let mask = (u64::MAX << left) & (u64::MAX >> (64 - right));
+                    let rows = occupied
+                        .entry((bx, y / 64))
+                        .or_insert_with(|| Box::new([0; 64]));
+                    let row = &mut rows[(y % 64) as usize];
+                    ensure!(
+                        *row & mask == 0,
+                        "overlapping source cells at ({}, {})",
+                        point.x,
+                        point.y
+                    );
+                    *row |= mask;
+                }
+            }
+        }
         let mut band_values = [None; 4];
         for band in point_bands {
             ensure!(
