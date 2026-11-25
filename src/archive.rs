@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeSet,
-    fs::{self, OpenOptions},
+    fs,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::mpsc::{SyncSender, sync_channel},
@@ -16,6 +16,7 @@ use tracing::info;
 use crate::{
     metadata,
     model::PreparedProduct,
+    output::PendingFile,
     prepare, quantize,
     tile::{
         ColorEncoding, ColorMap, DetailSchedule, MvtLayout, RASTER_TILE_SIZES, RasterLayout,
@@ -447,8 +448,11 @@ fn write_manifest(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    fs::write(path, serde_json::to_vec_pretty(&manifest)?)
+    let (pending, mut file) = PendingFile::create(path)?;
+    file.write_all(&serde_json::to_vec_pretty(&manifest)?)
         .with_context(|| format!("failed to write the manifest {}", path.display()))?;
+    drop(file);
+    pending.persist()?;
     info!(manifest = %path.display(), times = products.len(), "wrote raster manifest");
     Ok(())
 }
@@ -574,13 +578,7 @@ fn write_archive(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(output)
-        .with_context(|| format!("failed to create output {}", output.display()))?;
+    let (pending, mut file) = PendingFile::create(output)?;
     // A PNG is already deflated; gzipping it again only costs time.
     let (tile_type, tile_compression) = match output_format {
         TileOutput::Mvt(_) => (TileType::Mvt, Compression::Gzip),
@@ -641,6 +639,8 @@ fn write_archive(
     writer.finalize()?;
     normalize_empty_leaf_offset(&mut file)?;
     file.flush()?;
+    drop(file);
+    pending.persist()?;
     info!(
         output = %output.display(),
         layers = products.len(),
