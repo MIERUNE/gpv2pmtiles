@@ -1,8 +1,16 @@
-use std::path::PathBuf;
+use std::{
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+};
 
-use anyhow::Result;
-use clap::Parser;
-use gpv2pmtiles::{ConvertOptions, convert};
+use anyhow::{Context, Result};
+use clap::{
+    ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser, error::ErrorKind,
+    parser::ValueSource,
+};
+use gpv2pmtiles::{ConvertOptions, convert, remove_unfinished_outputs};
+use serde_json::Value;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -13,6 +21,15 @@ struct Cli {
     /// Output PMTiles archive. With --raster and several forecast times, this
     /// must contain {seq} or {valid_time}, such as wind_{valid_time}.pmtiles.
     output: PathBuf,
+
+    /// Take option defaults from a JSON file holding one object, which maps
+    /// long option names without the dashes to values, such as
+    /// {"product": "hrnowc/intensity", "max-zoom": 9, "omit-zero": true}.
+    /// A flag takes true or false, and an option that can be repeated takes
+    /// an array as well. A "description" key is ignored. Options given on the
+    /// command line take precedence over the file.
+    #[arg(long, value_name = "FILE")]
+    profile: Option<PathBuf>,
 
     /// Product to convert, such as hrnowc/intensity. Required when the input contains several products.
     #[arg(long)]
@@ -185,7 +202,14 @@ struct Cli {
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt().compact().init();
-    let cli = Cli::parse();
+    let cli = parse_cli(std::env::args_os().collect()).unwrap_or_else(|error| error.exit());
+    // Outputs are written under a temporary name until complete; an
+    // interrupted run removes them rather than leaving them behind.
+    ctrlc::set_handler(|| {
+        remove_unfinished_outputs();
+        std::process::exit(130);
+    })
+    .context("failed to install the interrupt handler")?;
     convert(
         &cli.input,
         &cli.output,
@@ -214,4 +238,170 @@ fn main() -> Result<()> {
             min_lead_time: cli.min_lead_time,
         },
     )
+}
+
+/// Parses the command line, filling options it leaves out from `--profile`.
+fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, clap::Error> {
+    let matches = Cli::command().try_get_matches_from(&args)?;
+    if let Some(profile) = matches.get_one::<PathBuf>("profile") {
+        let defaults = profile_args(profile, &matches)
+            .map_err(|message| Cli::command().error(ErrorKind::InvalidValue, message))?;
+        // Ahead of the given arguments, which a profile never overrides.
+        args.splice(1..1, defaults);
+        return Cli::try_parse_from(args);
+    }
+    Cli::from_arg_matches(&matches)
+}
+
+/// Turns a profile into arguments for the options `given` does not set.
+fn profile_args(path: &Path, given: &ArgMatches) -> Result<Vec<OsString>, String> {
+    let file = path.display();
+    let text =
+        fs::read_to_string(path).map_err(|error| format!("cannot read profile {file}: {error}"))?;
+    let profile: Value =
+        serde_json::from_str(&text).map_err(|error| format!("invalid profile {file}: {error}"))?;
+    let Value::Object(profile) = profile else {
+        return Err(format!("profile {file} must hold one JSON object"));
+    };
+    let command = Cli::command();
+    let mut args = Vec::new();
+    for (key, value) in &profile {
+        if key == "description" {
+            continue;
+        }
+        let option = command
+            .get_arguments()
+            .find(|option| option.get_long() == Some(key) && key != "profile")
+            .ok_or_else(|| format!("profile {file} has unknown option {key:?}"))?;
+        if given.value_source(option.get_id().as_str()) == Some(ValueSource::CommandLine) {
+            continue;
+        }
+        let values = match value {
+            Value::Array(values) if matches!(option.get_action(), ArgAction::Append) => {
+                values.iter().collect()
+            }
+            value => vec![value],
+        };
+        for value in values {
+            let value = match value {
+                Value::Bool(set) if !option.get_action().takes_values() => {
+                    if *set {
+                        args.push(format!("--{key}").into());
+                    }
+                    continue;
+                }
+                _ if !option.get_action().takes_values() => {
+                    return Err(format!(
+                        "profile option {key:?} is a flag; give true or false"
+                    ));
+                }
+                Value::String(value) => value.clone(),
+                Value::Number(value) => value.to_string(),
+                Value::Bool(value) => value.to_string(),
+                _ => {
+                    return Err(format!(
+                        "profile option {key:?} takes a string, number or boolean"
+                    ));
+                }
+            };
+            // Joined with '=' so that a value starting with '-' stays a value.
+            args.push(format!("--{key}={value}").into());
+        }
+    }
+    Ok(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_with(profile: &str, extra: &[&str]) -> Result<Cli, clap::Error> {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "gpv2pmtiles-profile-{}-{}.json",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::write(&path, profile).unwrap();
+        let mut args: Vec<OsString> = ["gpv2pmtiles", "in.grib2", "out.pmtiles", "--profile"]
+            .map(OsString::from)
+            .into();
+        args.push(path.clone().into());
+        args.extend(extra.iter().map(OsString::from));
+        let cli = parse_cli(args);
+        fs::remove_file(path).unwrap();
+        cli
+    }
+
+    #[test]
+    fn a_profile_supplies_defaults() {
+        let cli = parse_with(
+            r#"{
+                "description": "hourly rain",
+                "product": "hrnowc/intensity",
+                "layer-seq-start": 1,
+                "max-zoom": 9,
+                "omit-zero": true,
+                "skip-analysis": false,
+                "quantize": ["0:0,1:1", "-1:0"]
+            }"#,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(cli.product.as_deref(), Some("hrnowc/intensity"));
+        assert_eq!(cli.layer_seq_start, 1);
+        assert_eq!(cli.max_zoom, Some(9));
+        assert!(cli.omit_zero);
+        assert!(!cli.skip_analysis);
+        assert_eq!(cli.quantize, ["0:0,1:1", "-1:0"]);
+        assert_eq!(cli.input, Path::new("in.grib2"));
+    }
+
+    #[test]
+    fn the_command_line_takes_precedence() {
+        let cli = parse_with(
+            r#"{"max-zoom": 9, "quantize": ["0:0"], "layer-name-pattern": "rain_{seq}"}"#,
+            &["--max-zoom", "5", "--quantize", "1:1"],
+        )
+        .unwrap();
+        assert_eq!(cli.max_zoom, Some(5));
+        // A repeated option is replaced, not appended to.
+        assert_eq!(cli.quantize, ["1:1"]);
+        assert_eq!(cli.layer_name_pattern, "rain_{seq}");
+    }
+
+    #[test]
+    fn a_wrong_profile_is_a_usage_error() {
+        for profile in [
+            r#"{"max-zom": 1}"#,
+            r#"{"profile": "other.json"}"#,
+            r#"{"help": true}"#,
+            r#"{"version": true}"#,
+            r#"{"max-zoom": [1]}"#,
+            r#"{"max-zoom": null}"#,
+            r#"{"omit-zero": "yes"}"#,
+            r#"{"rain": {"max-zoom": 1}}"#,
+            r#"{"max-zoom": "x"}"#,
+            "[]",
+            "",
+            r#"{"max-zoom": 1} {"max-zoom": 2}"#,
+        ] {
+            let error = parse_with(profile, &[]).map(|_| ()).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{profile}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_missing_profile_is_a_usage_error() {
+        let args = [
+            "gpv2pmtiles",
+            "in.grib2",
+            "out.pmtiles",
+            "--profile",
+            "/nonexistent.json",
+        ]
+        .map(OsString::from)
+        .into();
+        assert_eq!(parse_cli(args).map(|_| ()).unwrap_err().exit_code(), 2);
+    }
 }

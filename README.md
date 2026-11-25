@@ -26,6 +26,28 @@ cargo run --release -- \
  
 この例では `rain250m_0` から `rain250m_11` までのソースレイヤーが作成されます。
 
+- スレッド数は既定で論理CPU数です。変えるときは環境変数 `RAYON_NUM_THREADS` を指定します。
+- 出力は同じディレクトリの一時ファイルに書き、完成してから置き換えます。失敗したときや Ctrl+C・SIGTERM で中断したときは一時ファイルを消すので、書きかけのアーカイブは残りません。
+
+### プロファイル (`--profile`)
+
+変換の設定をJSONファイルにまとめ、`--profile FILE` で読み込めます。キーはオプション名から先頭の `--` を除いたもの、値はオプションの値です。フラグは `true` か `false`、繰り返し指定できるオプション（`--quantize` など）は配列でも書けます。`description` キーは説明用で、無視されます。コマンドラインで指定したオプションはプロファイルより優先し、繰り返し指定できるオプションもプロファイルの値に追加せず置き換えます。
+
+```json
+{
+  "description": "降水ナウキャスト",
+  "product": "hrnowc/intensity",
+  "layer-count": 12,
+  "layer-name-pattern": "rain250m_{seq}",
+  "quantize": "0,1,5,10,20,30,50,80",
+  "omit-zero": true
+}
+```
+
+```bash
+cargo run --release -- input.grib2.bin.gz output.pmtiles --profile rain250m.json --max-zoom 9
+```
+
 ## 値の量子化 (`--quantize`)
 
 値を階級にまとめてから変換します。タイル容量の大部分がジオメトリなので、階級を粗くして隣接セルを統合するのが最も効くサイズ削減です。

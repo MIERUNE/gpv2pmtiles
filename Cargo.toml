@@ -18,6 +18,7 @@ zlib-rs = ["flate2/zlib-rs"]
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
+ctrlc = { version = "3.5.3", features = ["termination"] }
 flate2 = "1.1.9"
 fast-mvt = { version = "0.7.0", default-features = false, features = ["writer"] }
 fast_hilbert = "2.1.0"
